@@ -1,7 +1,7 @@
 #ifndef IO_HANDLER_HPP
 #define IO_HANDLER_HPP
 
-#include "state.hpp"
+#include "data_structures.hpp"
 #include <string>
 #include <vector>
 
