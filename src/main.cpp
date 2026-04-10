@@ -1,5 +1,6 @@
 #include "include/data_structures.hpp"
 #include "include/io_handler.hpp"
+#include "include/dependency.hpp"
 #include <exception>
 #include <iostream>
 
@@ -18,10 +19,18 @@ int main(int argc, char* argv[]) {
 
 		std::cout << "Loaded " << instructions.size() << " instructions from " << input_path << std::endl;
 
+        // This updates the basic block information for each instruction based on loop boundaries.
+        update_instruction_bb(instructions);
+
+        // This performs dependency analysis and fills the analysis table with dependency information.
+        std::vector<DependencyAnalysisTableEntry> analysis_table;
+        dependency_analysis(instructions, analysis_table);
 		// Scheduler logic can now use "instructions".
 		return 0;
 	} catch (const std::exception& e) {
 		std::cerr << "Error: " << e.what() << std::endl;
 		return 1;
 	}
+
+    
 }

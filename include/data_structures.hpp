@@ -18,6 +18,12 @@ enum class InstructionKind {
     LoopPip
 };
 
+enum class BasicBlock {
+    BB0,
+    BB1,
+    BB2,
+};
+
 struct Bundle {
     std::string ALU0 = "nop";
     std::string ALU1 = "nop";
@@ -44,6 +50,8 @@ struct Instruction {
 
     bool has_loop_target = false;
     int loop_target = -1;
+
+    BasicBlock basic_block = BasicBlock::BB0;
 };
 
 struct DependencyAnalysisTableEntry {
