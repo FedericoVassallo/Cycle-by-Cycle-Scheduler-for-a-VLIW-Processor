@@ -1,4 +1,4 @@
-#include "include/state.hpp"
+#include "include/data_structures.hpp"
 #include "include/io_handler.hpp"
 #include <exception>
 #include <iostream>
@@ -11,7 +11,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	const std::string input_path = argv[1];
-    
+
 	try {
 		// This loads JSON instruction strings and parses them into typed records.
 		std::vector<Instruction> instructions = IOHandler::read_and_parse_instructions(input_path);

@@ -1,5 +1,5 @@
-#include "include/scheduler.hpp"
-#include "include/state.hpp"
+#include "include/dependency.hpp"
+#include "include/data_structures.hpp"
 #include "include/io_handler.hpp"
 
 void dependency_analysis(const std::vector<Instruction>& instructions, std::vector<DependencyAnalysisTableEntry>& analysis_table) {
