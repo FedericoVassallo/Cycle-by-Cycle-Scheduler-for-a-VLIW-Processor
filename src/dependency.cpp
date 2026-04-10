@@ -76,12 +76,13 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
                 }
             }
         }
+
         // Dependencies: Check next instructions for register usage to find interloop dependencies.
         for (int j = i; j < static_cast<int>(instructions.size()); ++j) { // We start from i because we want to include the current instruction as well, in case it is a producer for itself in the next loop 
             const Instruction& next_instr = instructions[j];
             if (next_instr.destination_register != -1) {
                 // Check if the next instruction reads from a register that is written by the current instruction.
-                if (std::find(instr.source_registers.begin(), instr.source_registers.end(), next_instr.destination_register) != next_instr.source_registers.end()) {
+                if (std::find(instr.source_registers.begin(), instr.source_registers.end(), next_instr.destination_register) != instr.source_registers.end()) {
                     if (next_instr.basic_block == BasicBlock::BB1 && instr.basic_block == BasicBlock::BB1 && j >= i) {
                         // If both instructions are in BB1 and the consumer is before the producer, it's an interloop dependency.
                         entry.interloop_dependencies.push_back(j);
