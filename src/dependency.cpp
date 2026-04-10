@@ -51,27 +51,49 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
             entry.destination_register = instr.destination_register;
         }
 
-        /*
-        // Local dependencies: Check previous instructions for register usage.
+        
+        // Dependencies: Check previous instructions for register usage.
         for (int j = i - 1; j >= 0; --j) {
             const Instruction& prev_instr = instructions[j];
             if (prev_instr.destination_register != -1) {
+
                 // Check if current instruction reads from a register that was written by a previous instruction.
                 if (std::find(instr.source_registers.begin(), instr.source_registers.end(), prev_instr.destination_register) != instr.source_registers.end()) {
-                    entry.local_dependencies.push_back(j);
+                    if (prev_instr.basic_block == instr.basic_block) {
+                        // If they are in the same basic block, it's a local dependency.
+                        entry.local_dependencies.push_back(j);
+                    }
+                    else if (prev_instr.basic_block == BasicBlock::BB0 && (instr.basic_block == BasicBlock::BB1 || instr.basic_block == BasicBlock::BB2)) {
+                        // If the previous instruction (producer) is in BB0 and the current instruction is in BB1 or BB2, it's a loop invariant dependency.
+                        entry.loop_invariant_dependencies.push_back(j);
+                    }
+                    else if (prev_instr.basic_block == BasicBlock::BB1 && instr.basic_block == BasicBlock::BB2) {
+                        // If the previous instruction (producer) is in BB1 and the current instruction is in BB2, it's a post loop dependency.
+                        entry.post_loop_dependencies.push_back(j);
+                    }
+                    // If the producer is in BB1 (as the consumer) but is after the consumer in the loop, we have an interloop dependency
+                    // TODO: We will have to look for interloop dependencies in a second pass, once we have identified all the instructions that belong to the loop (BB1).
                 }
             }
         }
-        */
+        // Dependencies: Check next instructions for register usage to find interloop dependencies.
+        for (int j = i; j < static_cast<int>(instructions.size()); ++j) { // We start from i because we want to include the current instruction as well, in case it is a producer for itself in the next loop 
+            const Instruction& next_instr = instructions[j];
+            if (next_instr.destination_register != -1) {
+                // Check if the next instruction reads from a register that is written by the current instruction.
+                if (std::find(instr.source_registers.begin(), instr.source_registers.end(), next_instr.destination_register) != next_instr.source_registers.end()) {
+                    if (next_instr.basic_block == BasicBlock::BB1 && instr.basic_block == BasicBlock::BB1 && j >= i) {
+                        // If both instructions are in BB1 and the consumer is before the producer, it's an interloop dependency.
+                        entry.interloop_dependencies.push_back(j);
+                    }
+                }
+            }
+        }
+        
 
         // Interloop, loop invariant, and post loop dependencies would require more complex analysis involving control flow and loops, which is not implemented here.
 
         analysis_table.push_back(entry);
     }
-
-    // Once that all the instructions have been inserted into the analysis table, we can perform 
-    // additional passes to identify interloop dependencies, loop invariant dependencies, 
-    // and post loop dependencies based on control flow and loop structures. 
-
 
 }
