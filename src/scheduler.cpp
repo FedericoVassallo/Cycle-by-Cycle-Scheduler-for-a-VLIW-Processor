@@ -21,6 +21,7 @@ int calculate_II_res(const std::vector<Instruction>& instructions) {
             case InstructionKind::Add:
             case InstructionKind::Addi:
             case InstructionKind::Sub:
+            case InstructionKind::Mov:
                 alu_count++;
                 break;
             case InstructionKind::Mulu:

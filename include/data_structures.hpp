@@ -85,8 +85,6 @@ struct SlotTable {
     void reserve_resources(int actual_cycle, InstructionKind instr_kind);
 };
 
-
-
 #endif // DATA_STRUCTURES_HPP
 
 
