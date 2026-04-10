@@ -5,17 +5,17 @@
 #include <vector>
 
 enum class InstructionKind {
-    kUnknown,
-    kNop,
-    kMov,
-    kAdd,
-    kAddi,
-    kSub,
-    kMulu,
-    kLd,
-    kSt,
-    kLoop,
-    kLoopPip
+    Unknown,
+    Nop,
+    Mov,
+    Add,
+    Addi,
+    Sub,
+    Mulu,
+    Ld,
+    St,
+    Loop,
+    LoopPip
 };
 
 struct Bundle {
@@ -30,7 +30,7 @@ struct Instruction {
     std::string raw_text;
     std::string predicate_register;
     std::string opcode;
-    InstructionKind kind = InstructionKind::kUnknown;
+    InstructionKind kind = InstructionKind::Unknown;
 
     int destination_register = -1;
     std::vector<int> source_registers;
@@ -49,7 +49,7 @@ struct Instruction {
 struct DependencyAnalysisTableEntry {
     int address = -1;
     int id = -1;
-    InstructionKind instruction_type = InstructionKind::kUnknown;
+    InstructionKind instruction_type = InstructionKind::Unknown;
     int destination_register = -1;
     std::vector<int> local_dependencies;
     std::vector<int> interloop_dependencies;
