@@ -20,7 +20,7 @@ int main(int argc, char* argv[]) {
 		std::cout << "Loaded " << instructions.size() << " instructions from " << input_path << std::endl;
 
         // This updates the basic block information for each instruction based on loop boundaries.
-        update_instruction_bb(instructions);
+        update_instructions_bb(instructions);
 
         // This performs dependency analysis and fills the analysis table with dependency information.
         std::vector<DependencyAnalysisTableEntry> analysis_table;
