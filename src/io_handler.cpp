@@ -192,7 +192,7 @@ namespace IOHandler {
         const std::vector<std::string> args = split_comma_separated(remaining);
 
         if (opcode == "nop") {
-            instruction.kind = InstructionKind::kNop;
+            instruction.kind = InstructionKind::Nop;
             if (!remaining.empty()) {
                 throw std::runtime_error("nop takes no operands: " + instruction_text);
             }
@@ -200,7 +200,7 @@ namespace IOHandler {
         }
 
         if (opcode == "mov") {
-            instruction.kind = InstructionKind::kMov;
+            instruction.kind = InstructionKind::Mov;
             if (args.size() != 2) {
                 throw std::runtime_error("mov expects 2 operands: " + instruction_text);
             }
@@ -226,13 +226,13 @@ namespace IOHandler {
 
         if (opcode == "add" || opcode == "addi" || opcode == "sub" || opcode == "mulu") {
             if (opcode == "add") {
-                instruction.kind = InstructionKind::kAdd;
+                instruction.kind = InstructionKind::Add;
             } else if (opcode == "addi") {
-                instruction.kind = InstructionKind::kAddi;
+                instruction.kind = InstructionKind::Addi;
             } else if (opcode == "sub") {
-                instruction.kind = InstructionKind::kSub;
+                instruction.kind = InstructionKind::Sub;
             } else {
-                instruction.kind = InstructionKind::kMulu;
+                instruction.kind = InstructionKind::Mulu;
             }
 
             if (args.size() != 3) {
@@ -253,7 +253,7 @@ namespace IOHandler {
         }
 
         if (opcode == "ld") {
-            instruction.kind = InstructionKind::kLd;
+            instruction.kind = InstructionKind::Ld;
             if (args.size() != 2) {
                 throw std::runtime_error("ld expects 2 operands: " + instruction_text);
             }
@@ -264,7 +264,7 @@ namespace IOHandler {
         }
 
         if (opcode == "st") {
-            instruction.kind = InstructionKind::kSt;
+            instruction.kind = InstructionKind::St;
             if (args.size() != 2) {
                 throw std::runtime_error("st expects 2 operands: " + instruction_text);
             }
@@ -275,7 +275,7 @@ namespace IOHandler {
         }
 
         if (opcode == "loop" || opcode == "loop.pip") {
-            instruction.kind = (opcode == "loop") ? InstructionKind::kLoop : InstructionKind::kLoopPip;
+            instruction.kind = (opcode == "loop") ? InstructionKind::Loop : InstructionKind::LoopPip;
             if (args.size() != 1) {
                 throw std::runtime_error(opcode + " expects 1 operand: " + instruction_text);
             }
