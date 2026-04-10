@@ -1,8 +1,9 @@
 #include "include/dependency.hpp"
 #include "include/data_structures.hpp"
 #include "include/io_handler.hpp"
+#include <stdexcept>
 
-void update_instruction_bb(std::vector<Instruction>& instructions) {
+void update_instructions_bb(std::vector<Instruction>& instructions) {
     BasicBlock current_bb = BasicBlock::BB0;
     for (int i = 0; i < static_cast<int>(instructions.size()); ++i) {
         Instruction& instr = instructions[i];
@@ -11,11 +12,17 @@ void update_instruction_bb(std::vector<Instruction>& instructions) {
         if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
             current_bb = BasicBlock::BB1; 
             // When we find the loop instruction, we can start assigning instructions to BB1
-            instr.basic_block = current_bb; // We set the BB of the loop instruction itself 
-            int loop_destination_id = instr.loop_target; // We identify the target of the loop 
-            for (int j = loop_destination_id; j < i; ++j) { 
-                // We set the BB of all the instructions in beetween to BB1
-                instructions[j].basic_block = current_bb;
+            instr.basic_block = current_bb; // We correct the BB of the loop instruction itself 
+            if (instr.has_loop_target && instr.loop_target >= 0 && instr.loop_target < i) {
+                int loop_destination_id = instr.loop_target; // We identify the target of the loop 
+                for (int j = loop_destination_id; j < i; ++j) { 
+                    // We set the BB of all the instructions in beetween to BB1
+                    instructions[j].basic_block = current_bb;
+                }    
+            }
+            else {
+                // If the loop instruction does not have a valid target, we can throw an error or handle it as needed.
+                throw std::runtime_error("Loop instruction at index " + std::to_string(i) + " does not have a valid loop target.");
             }
 
             current_bb = BasicBlock::BB2; // From now on, instrutions will belong to BB2
