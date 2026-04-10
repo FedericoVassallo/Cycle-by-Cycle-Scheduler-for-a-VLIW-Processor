@@ -1,7 +1,16 @@
+// version using loop (without loop.pip)
+void schedule_ASAP_basic()  {
 
+    // TODO
 
+}
 
+// version using loop.pip
+void schedule_ASAP_advanced()  {
 
+    // TODO
+
+}
 
 int calculate_II_res(const std::vector<Instruction>& instructions) {
 
@@ -42,12 +51,7 @@ int calculate_II_res(const std::vector<Instruction>& instructions) {
     int ii_mem = mem_count; // Each bundle can have 1 MEM instruction
 
     // The II_res is the maximum of the three calculated values
-    int ii_res = std::max({ii_alu, ii_mul, ii_mem});
+    int ii_res = std::max({ii_alu, ii_mul, ii_mem, 1}); // (the 1 is the ensure is at least 1)
 
     return ii_res;
 }
-
-
-
-
-           
