@@ -1,5 +1,5 @@
-#ifndef STATE_HPP
-#define STATE_HPP
+#ifndef DATA_STRUCTURES_HPP
+#define DATA_STRUCTURES_HPP
 
 #include <string>
 #include <vector>
@@ -57,6 +57,6 @@ struct DependencyAnalysisTableEntry {
     std::vector<int> post_loop_dependencies;
 };
 
-#endif // STATE_HPP
+#endif // DATA_STRUCTURES_HPP
 
 
