@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+*.o
+vliw_scheduler
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

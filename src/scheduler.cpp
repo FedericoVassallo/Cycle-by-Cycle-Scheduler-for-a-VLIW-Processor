@@ -1,3 +1,6 @@
+#include "data_structures.hpp"
+#include <algorithm>
+
 // version using loop (without loop.pip)
 void schedule_ASAP_basic()  {
 

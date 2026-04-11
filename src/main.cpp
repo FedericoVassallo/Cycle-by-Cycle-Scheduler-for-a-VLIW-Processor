@@ -1,6 +1,6 @@
-#include "include/data_structures.hpp"
-#include "include/io_handler.hpp"
-#include "include/dependency.hpp"
+#include "data_structures.hpp"
+#include "io_handler.hpp"
+#include "dependency.hpp"
 #include <exception>
 #include <iostream>
 
