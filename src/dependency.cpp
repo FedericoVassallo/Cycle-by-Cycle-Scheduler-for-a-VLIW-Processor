@@ -107,9 +107,6 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
                 }
             }
         }
-        
-
-        // Interloop, loop invariant, and post loop dependencies would require more complex analysis involving control flow and loops, which is not implemented here.
 
         analysis_table.push_back(entry);
     }
