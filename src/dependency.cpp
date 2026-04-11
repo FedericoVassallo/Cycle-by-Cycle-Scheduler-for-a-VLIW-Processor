@@ -72,7 +72,7 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
                         entry.post_loop_dependencies.push_back(j);
                     }
                     // If the producer is in BB1 (as the consumer) but is after the consumer in the loop, we have an interloop dependency
-                    // TODO: We will have to look for interloop dependencies in a second pass, once we have identified all the instructions that belong to the loop (BB1).
+                    // We will have to look for interloop dependencies in a second pass, once we have identified all the instructions that belong to the loop (BB1).
                 }
             }
         }
@@ -86,7 +86,24 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
                     if (next_instr.basic_block == BasicBlock::BB1 && instr.basic_block == BasicBlock::BB1 && j >= i) {
                         // If both instructions are in BB1 and the consumer is before the producer, it's an interloop dependency.
                         entry.interloop_dependencies.push_back(j);
-                    }
+
+                        //If the producer (initializer) is in BB0 and the consumer is in BB1 and gets updated every loop, the producer in BB0
+                        // is also considered as an interloop dependency (see example in PDF)
+                        // We have to check the previously assigned loop invariant dependencies
+                        std::vector<int> to_remove;
+                        for (int k : entry.loop_invariant_dependencies) {
+                            if (instructions[k].basic_block == BasicBlock::BB0 && instructions[k].destination_register == next_instr.destination_register) {
+                                entry.interloop_dependencies.push_back(k);
+                                to_remove.push_back(k);  // Mark for removal
+                            }
+                        }
+                        // Now erase after iteration is complete
+                        for (int k : to_remove) {
+                            entry.loop_invariant_dependencies.erase(std::remove(entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end(), k), entry.loop_invariant_dependencies.end());
+                        }
+
+                    } 
+                    
                 }
             }
         }
