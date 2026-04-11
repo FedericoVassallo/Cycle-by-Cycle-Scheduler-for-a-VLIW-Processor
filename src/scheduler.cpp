@@ -1,5 +1,5 @@
 #include "scheduler.hpp"
-
+#include <stdexcept>
 #include <algorithm>
 
 namespace {
@@ -109,6 +109,56 @@ int max_ready_cycle(const std::vector<int>& deps,
     return earliest;
 }
 
+// Checks loop-carried recurrence constraints after a full BB1 placement attempt.
+// For a distance-1 recurrence edge producer -> consumer:
+// consumer_cycle >= producer_cycle + latency(producer) - II
+bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
+                                     const std::vector<bool>& is_bb1,
+                                     const std::vector<int>& analysis_index_by_id,
+                                     const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                                     const std::vector<int>& scheduled_cycle,
+                                     const std::vector<InstructionKind>& kind_by_id,
+                                     int ii) {
+
+    // Sanity checks to ensure we have valid data before checking constraints
+    for (const int id : bb1_ids) {
+        if (id < 0 || id >= static_cast<int>(analysis_index_by_id.size())) {
+            continue;
+        }
+
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) {
+            continue;
+        }
+
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        if (id < 0 || id >= static_cast<int>(scheduled_cycle.size()) || scheduled_cycle[id] < 0) {
+            continue;
+        }
+
+        for (const int dep_id : entry.interloop_dependencies) {
+            if (dep_id < 0 || dep_id >= static_cast<int>(scheduled_cycle.size())) {
+                continue;
+            }
+            if (scheduled_cycle[dep_id] < 0) {
+                continue;
+            }
+
+            // We check if the consumer is scheduled at least latency cycles after the producer, considering the modulo scheduling with II.
+            const int required_cycle = scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]) - ii;
+            // We need to check if the producer is in BB1 to understand if we need to apply the constraint 
+            // (if the producer is not in BB1, it means that it is scheduled outside the loop and we don't
+            // need to apply the constraint, since the consumer will always be scheduled after the producer)
+
+            if (scheduled_cycle[id] < required_cycle && is_bb1[dep_id]) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // Schedules an entry (no modulo scheduling, used for BB0 and BB2 instructions)
 int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
                              const std::vector<Instruction>& instructions,
@@ -134,6 +184,7 @@ int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
 }
 
 bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
+                              const std::vector<bool>& is_bb1,
                               const std::vector<int>& analysis_index_by_id,
                               const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                               std::vector<Bundle>& schedule,
@@ -157,11 +208,20 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
         earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
 
-         
-        earliest = std::max(earliest, max_ready_cycle(entry.interloop_dependencies, scheduled_cycle, kind_by_id));
+        // BB1 instructions must stay inside the loop window [loop_beginning, loop_beginning + II).
+        earliest = std::max(earliest, loop_beginning);
+
+        // If earliest >= loop_beginning + ii, it means that we cannot schedule the instruction in the current II window, so we can already return false and increase II for the next scheduling attempt
+        if (earliest >= loop_beginning + ii) { 
+            ii++; 
+            return false;
+        }
 
         int cycle = earliest;
         while (true) {
+            if (cycle > 1000) { // Sanity check to avoid infinite loops in case of bugs
+                throw std::runtime_error("Scheduling failed: exceeded reasonable cycle limit.");
+            }
             ensure_bundle_capacity(schedule, cycle);
             if (slot_table.can_schedule(cycle, entry.instruction_type) &&
                 can_place_in_bundle(schedule[cycle], entry.instruction_type)) {
@@ -179,13 +239,23 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
         slot_table.reserve_resources(cycle, entry.instruction_type);
         scheduled_cycle[id] = cycle;
     }
+
+    // Validate loop-carried dependencies once all BB1 instructions have tentative cycles.
+    if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table, scheduled_cycle, kind_by_id, ii)) {
+        ii++;
+        return false;
+    }
+    // If we reach this point, the scheduling was successful with the current II, considering all possible dependencies and resource constraints.
+
     return true;
 }
 
 } // namespace
 
 // version using loop (without loop.pip)
-void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_table, std::vector<Bundle>& schedule, std::vector<Instruction>& instructions) {
+void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                         std::vector<Bundle>& schedule,
+                         const std::vector<Instruction>& instructions) {
     
     // We clear the schedule vector for rubustness (already supposed to be empty)
     schedule.clear();
@@ -202,6 +272,7 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
     std::vector<int> bb0_ids;
     std::vector<int> bb1_ids;
     std::vector<int> bb2_ids;
+    std::vector<bool> is_bb1(instruction_count, false); // To quickly check if an instruction belongs to BB1
 
     // We analyse all the instructions in the dependency analysis table to allocate them in the different basic blocks and to extract useful information for 
     // the scheduling (the kind of the instruction and the index of the entry of the analysis table based on the id of the instruction)
@@ -225,6 +296,7 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
                 break;
             case BasicBlock::BB1:
                 bb1_ids.push_back(entry.id);
+                is_bb1[entry.id] = true;
                 break;
             case BasicBlock::BB2:
                 bb2_ids.push_back(entry.id);
@@ -267,11 +339,14 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
         }
         
         // Try to schedule all BB1 instructions with current II
-        if (try_bb1_schedule_with_ii(bb1_ids, analysis_index_by_id, analysis_table, schedule,
+        if (try_bb1_schedule_with_ii(bb1_ids, is_bb1, analysis_index_by_id, analysis_table, schedule,
                                      scheduled_cycle, kind_by_id, instructions, slot_table, ii, loop_beginning)) {
             break;  // Success, exit retry loop
         }
         // If failed, ii was incremented in try_bb1_schedule_with_ii, so loop tries again
+        if (ii > 100) { // Sanity check to avoid infinite loops in case of bugs
+            throw std::runtime_error("Scheduling failed: exceeded reasonable II limit.");
+        }
     }
 
     // BB2 executes after the loop, so it must respect both local and post-loop dependencies.
@@ -288,7 +363,9 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
 }
 
 // version using loop.pip
-void schedule_ASAP_advanced(std::vector<DependencyAnalysisTableEntry>& analysis_table, std::vector<Bundle>& schedule, std::vector<Instruction>& instructions) {
+void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                            std::vector<Bundle>& schedule,
+                            const std::vector<Instruction>& instructions) {
 
     // TODO
 
