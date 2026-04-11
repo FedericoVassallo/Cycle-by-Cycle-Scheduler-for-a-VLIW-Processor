@@ -154,7 +154,8 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
     std::vector<int> bb1_ids;
     std::vector<int> bb2_ids;
 
-    // We analyse all the instructions in the dependency analysis table 
+    // We analyse all the instructions in the dependency analysis table to allocate them in the different basic blocks and to extract useful information for 
+    // the scheduling (the kind of the instruction and the index of the entry of the analysis table based on the id of the instruction)
     for (int analysis_index = 0; analysis_index < static_cast<int>(analysis_table.size()); ++analysis_index) {
 
         // We extract an entry from the dependency table 
@@ -203,16 +204,21 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
     slot_table.init_reset(ii);
 
     for (const int id : bb1_ids) {
+        // With the id we find the corresponding entry index in the analysis table 
         const int entry_index = analysis_index_by_id[id];
         if (entry_index < 0) {
             continue;
         }
+
+        // We extract the entry from the analysis table and we schedule it with modulo scheduling 
         const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
 
+        // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
         earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
 
         // First implementation: treat interloop deps conservatively like normal dependencies.
+        // TODO: we have to consider ii, and try increasing it if we are not able to schedule 
         earliest = std::max(earliest, max_ready_cycle(entry.interloop_dependencies, scheduled_cycle, kind_by_id));
 
         int cycle = earliest;
