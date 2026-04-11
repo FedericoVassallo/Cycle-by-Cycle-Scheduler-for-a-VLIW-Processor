@@ -133,6 +133,55 @@ int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
     return cycle;
 }
 
+bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
+                              const std::vector<int>& analysis_index_by_id,
+                              const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                              std::vector<Bundle>& schedule,
+                              std::vector<int>& scheduled_cycle,
+                              const std::vector<InstructionKind>& kind_by_id,
+                              const std::vector<Instruction>& instructions,
+                              SlotTable& slot_table,
+                              int& ii,
+                              int loop_beginning) {
+    for (const int id : bb1_ids) {
+        // With the id we find the corresponding entry index in the analysis table 
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) {
+            continue;
+        }
+
+        // We extract the entry from the analysis table and we schedule it with modulo scheduling 
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+
+        // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
+        int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
+        earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
+
+         
+        earliest = std::max(earliest, max_ready_cycle(entry.interloop_dependencies, scheduled_cycle, kind_by_id));
+
+        int cycle = earliest;
+        while (true) {
+            ensure_bundle_capacity(schedule, cycle);
+            if (slot_table.can_schedule(cycle, entry.instruction_type) &&
+                can_place_in_bundle(schedule[cycle], entry.instruction_type)) {
+                break;
+            }
+            ++cycle;
+            if (cycle >= loop_beginning + ii) { 
+                // Cannot fit instruction in current II window; signal failure and increase II
+                ii++;
+                return false;
+            }
+        }
+
+        place_in_bundle(schedule[cycle], entry.instruction_type, instructions[id].raw_text);
+        slot_table.reserve_resources(cycle, entry.instruction_type);
+        scheduled_cycle[id] = cycle;
+    }
+    return true;
+}
+
 } // namespace
 
 // version using loop (without loop.pip)
@@ -199,41 +248,30 @@ void schedule_ASAP_basic(std::vector<DependencyAnalysisTableEntry>& analysis_tab
     }
 
     // BB1 is scheduled with modulo resource constraints through SlotTable.
-    const int ii = std::max(1, calculate_II_res(instructions));
-    SlotTable slot_table;
-    slot_table.init_reset(ii);
+    int ii = std::max(1, calculate_II_res(instructions));
+    const int loop_beginning = static_cast<int>(schedule.size()); // We start scheduling the loop from the cycle after the last scheduled instruction of BB0 (the setup code)
 
-    for (const int id : bb1_ids) {
-        // With the id we find the corresponding entry index in the analysis table 
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) {
-            continue;
+    // Retry BB1 scheduling with increasing II until successful
+    while (true) {
+        SlotTable slot_table;
+        slot_table.init_reset(ii);
+        
+        // Reset BB1 scheduled cycles for this attempt
+        for (const int id : bb1_ids) {
+            scheduled_cycle[id] = -1;
         }
-
-        // We extract the entry from the analysis table and we schedule it with modulo scheduling 
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
-
-        // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
-        int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
-        earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
-
-        // First implementation: treat interloop deps conservatively like normal dependencies.
-        // TODO: we have to consider ii, and try increasing it if we are not able to schedule 
-        earliest = std::max(earliest, max_ready_cycle(entry.interloop_dependencies, scheduled_cycle, kind_by_id));
-
-        int cycle = earliest;
-        while (true) {
-            ensure_bundle_capacity(schedule, cycle);
-            if (slot_table.can_schedule(cycle, entry.instruction_type) &&
-                can_place_in_bundle(schedule[cycle], entry.instruction_type)) {
-                break;
-            }
-            ++cycle;
+        
+        // Clear loop body bundles
+        for (int i = loop_beginning; i < static_cast<int>(schedule.size()); ++i) {
+            schedule[i] = Bundle();
         }
-
-        place_in_bundle(schedule[cycle], entry.instruction_type, instructions[id].raw_text);
-        slot_table.reserve_resources(cycle, entry.instruction_type);
-        scheduled_cycle[id] = cycle;
+        
+        // Try to schedule all BB1 instructions with current II
+        if (try_bb1_schedule_with_ii(bb1_ids, analysis_index_by_id, analysis_table, schedule,
+                                     scheduled_cycle, kind_by_id, instructions, slot_table, ii, loop_beginning)) {
+            break;  // Success, exit retry loop
+        }
+        // If failed, ii was incremented in try_bb1_schedule_with_ii, so loop tries again
     }
 
     // BB2 executes after the loop, so it must respect both local and post-loop dependencies.
