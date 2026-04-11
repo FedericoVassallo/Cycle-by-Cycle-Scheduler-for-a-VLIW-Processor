@@ -321,7 +321,39 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
 
     // BB1 is scheduled with modulo resource constraints through SlotTable.
     int ii = std::max(1, calculate_II_res(instructions));
-    const int loop_beginning = static_cast<int>(schedule.size()); // We start scheduling the loop from the cycle after the last scheduled instruction of BB0 (the setup code)
+
+    // Compute loop_beginning: must be late enough that no BB1 instruction
+    // is delayed by a BB0 dependency, which would create empty bubbles
+    // at the start of the loop body (see Figure 9 in the PDF).
+    int loop_beginning = static_cast<int>(schedule.size());
+
+    for (const int id : bb1_ids) {
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+
+        // Check loop-invariant deps (BB0 → BB1)
+        int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies,
+                                        scheduled_cycle, kind_by_id);
+
+        // Check interloop deps that actually point to BB0 producers
+        // (these were reclassified from loop_invariant in dependency_analysis)
+        for (const int dep_id : entry.interloop_dependencies) {
+            if (dep_id >= 0 && dep_id < instruction_count &&
+                instructions[dep_id].basic_block == BasicBlock::BB0 &&
+                scheduled_cycle[dep_id] >= 0) {
+                bb0_ready = std::max(bb0_ready,
+                    scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
+            }
+        }
+
+        loop_beginning = std::max(loop_beginning, bb0_ready);
+    }
+
+    // Pad the schedule with empty bundles up to loop_beginning (these become BB0 delay slots)
+    if (loop_beginning > 0) {
+        ensure_bundle_capacity(schedule, loop_beginning - 1);
+    }
 
     // Retry BB1 scheduling with increasing II until successful
     while (true) {
