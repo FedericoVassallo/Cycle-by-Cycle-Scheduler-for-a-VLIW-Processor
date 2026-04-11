@@ -421,8 +421,141 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
                             std::vector<Bundle>& schedule,
                             const std::vector<Instruction>& instructions) {
 
-    // TODO
+    schedule.clear();
+    const int instruction_count = static_cast<int>(instructions.size());
 
+    std::vector<int> analysis_index_by_id(static_cast<size_t>(instruction_count), -1);
+    std::vector<InstructionKind> kind_by_id(static_cast<size_t>(instruction_count), InstructionKind::Unknown);
+
+    std::vector<int> bb0_ids;
+    std::vector<int> bb1_ids;
+    std::vector<int> bb2_ids;
+    std::vector<bool> is_bb1(instruction_count, false);
+
+    for (int analysis_index = 0; analysis_index < static_cast<int>(analysis_table.size()); ++analysis_index) {
+        const DependencyAnalysisTableEntry& entry = analysis_table[analysis_index];
+        if (entry.id < 0 || entry.id >= instruction_count) continue;
+
+        analysis_index_by_id[entry.id] = analysis_index;
+        kind_by_id[entry.id] = entry.instruction_type;
+
+        switch (instructions[entry.id].basic_block) {
+            case BasicBlock::BB0: bb0_ids.push_back(entry.id); break;
+            case BasicBlock::BB1: bb1_ids.push_back(entry.id); is_bb1[entry.id] = true; break;
+            case BasicBlock::BB2: bb2_ids.push_back(entry.id); break;
+        }
+    }
+
+    std::vector<int> scheduled_cycle(static_cast<size_t>(instruction_count), -1);
+
+    // BB0 scheduling
+    for (const int id : bb0_ids) {
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
+    }
+
+    // Push loop_beginning past any BB0 latency tails to avoid bubbles (see Figure 9)
+    int loop_beginning = static_cast<int>(schedule.size());
+
+    for (const int id : bb1_ids) {
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+
+        int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id);
+        for (const int dep_id : entry.interloop_dependencies) {
+            if (dep_id >= 0 && dep_id < instruction_count &&
+                instructions[dep_id].basic_block == BasicBlock::BB0 &&
+                scheduled_cycle[dep_id] >= 0) {
+                bb0_ready = std::max(bb0_ready, scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
+            }
+        }
+        loop_beginning = std::max(loop_beginning, bb0_ready);
+    }
+    if (loop_beginning > 0) {
+        ensure_bundle_capacity(schedule, loop_beginning - 1);
+    }
+
+    // Separate loop.pip from other BB1 instructions
+    int loop_id = -1;
+    std::vector<int> bb1_non_loop_ids;
+    for (const int id : bb1_ids) {
+        if (instructions[id].kind == InstructionKind::Loop || instructions[id].kind == InstructionKind::LoopPip) {
+            loop_id = id;
+        } else {
+            bb1_non_loop_ids.push_back(id);
+        }
+    }
+
+    // BB1 modulo scheduling with increasing II
+    int ii = std::max(1, calculate_II_res(instructions));
+
+    while (true) {
+        SlotTable slot_table;
+        slot_table.init_reset(ii);
+
+        for (const int id : bb1_ids) {
+            scheduled_cycle[id] = -1;
+        }
+        schedule.resize(loop_beginning);
+
+        bool failed = false;
+
+        for (const int id : bb1_non_loop_ids) {
+            const int entry_index = analysis_index_by_id[id];
+            if (entry_index < 0) continue;
+            const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+
+            int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
+            earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
+            earliest = std::max(earliest, loop_beginning);
+
+            // TODO: also account for interloop dependencies where the producer is
+            // already scheduled in BB1, using equation 2 rearranged as a lower bound
+            // on the consumer cycle. Skip BB0 producers and unscheduled producers.
+
+            // TODO: find the first cycle >= earliest where both the SlotTable allows
+            // scheduling (modulo resource check) and the bundle has a free slot.
+            // Unlike basic, there is no upper cycle bound since instructions can
+            // span multiple stages. Place the instruction and reserve resources.
+            // If you want, you can set a sanity-check upper bound and set failed=true.
+        }
+
+        if (failed) {
+            ii++;
+            if (ii > 100) throw std::runtime_error("Scheduling failed: exceeded reasonable II limit.");
+            continue;
+        }
+
+        // Validate all interloop constraints that couldn't be checked during scheduling
+        // (producers that appear after their consumer in program order)
+        if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table,
+                                             scheduled_cycle, kind_by_id, ii)) {
+            ii++;
+            if (ii > 100) throw std::runtime_error("Scheduling failed: exceeded reasonable II limit.");
+            continue;
+        }
+
+        break;
+    }
+
+    // TODO: place loop.pip in the Branch slot at the last bundle of the first stage,
+    // and update its loop target to point to loop_beginning
+
+    // TODO: compute the number of stages and each instruction's stage index —
+    // these will be needed later for register allocation and predication
+
+    // BB2 scheduling
+    for (const int id : bb2_ids) {
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        std::vector<int> deps = entry.post_loop_dependencies;
+        deps.insert(deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
+        schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id, deps);
+    }
 }
 
 int calculate_II_res(const std::vector<Instruction>& instructions) {
