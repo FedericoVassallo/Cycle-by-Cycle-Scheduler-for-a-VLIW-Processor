@@ -288,19 +288,11 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         analysis_index_by_id[entry.id] = analysis_index;
         kind_by_id[entry.id] = entry.instruction_type;
 
-
         // We divide all the entries in the basick blocks they belong to differentiate the scheduling strategy 
         switch (instructions[entry.id].basic_block) {
-            case BasicBlock::BB0:
-                bb0_ids.push_back(entry.id);
-                break;
-            case BasicBlock::BB1:
-                bb1_ids.push_back(entry.id);
-                is_bb1[entry.id] = true;
-                break;
-            case BasicBlock::BB2:
-                bb2_ids.push_back(entry.id);
-                break;
+            case BasicBlock::BB0: bb0_ids.push_back(entry.id); break;
+            case BasicBlock::BB1: bb1_ids.push_back(entry.id); is_bb1[entry.id] = true; break;
+            case BasicBlock::BB2: bb2_ids.push_back(entry.id); break;
         }
     }
 
@@ -309,7 +301,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
 
     // BB0 contains setup code, scheduled once before the loop body.
     for (const int id : bb0_ids) {
-        const int entry_index = analysis_index_by_id[id]; // Index of the entry of the analysis table 
+        const int entry_index = analysis_index_by_id[id];
         if (entry_index < 0) {
             continue;
         }
@@ -319,12 +311,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
     }
 
-    // BB1 is scheduled with modulo resource constraints through SlotTable.
-    int ii = std::max(1, calculate_II_res(instructions));
-
-    // Compute loop_beginning: must be late enough that no BB1 instruction
-    // is delayed by a BB0 dependency, which would create empty bubbles
-    // at the start of the loop body (see Figure 9 in the PDF).
+    // Push loop_beginning past any BB0 latency tails to avoid bubbles at the start of the loop body (see Figure 9)
     int loop_beginning = static_cast<int>(schedule.size());
 
     for (const int id : bb1_ids) {
@@ -332,51 +319,86 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         if (entry_index < 0) continue;
         const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
 
-        // Check loop-invariant deps (BB0 → BB1)
-        int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies,
-                                        scheduled_cycle, kind_by_id);
-
-        // Check interloop deps that actually point to BB0 producers
-        // (these were reclassified from loop_invariant in dependency_analysis)
+        int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id);
         for (const int dep_id : entry.interloop_dependencies) {
             if (dep_id >= 0 && dep_id < instruction_count &&
                 instructions[dep_id].basic_block == BasicBlock::BB0 &&
                 scheduled_cycle[dep_id] >= 0) {
-                bb0_ready = std::max(bb0_ready,
-                    scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
+                bb0_ready = std::max(bb0_ready, scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
             }
         }
-
         loop_beginning = std::max(loop_beginning, bb0_ready);
     }
 
-    // Pad the schedule with empty bundles up to loop_beginning (these become BB0 delay slots)
     if (loop_beginning > 0) {
         ensure_bundle_capacity(schedule, loop_beginning - 1);
     }
 
-    // Retry BB1 scheduling with increasing II until successful
+    // Separate the loop instruction from the other BB1 instructions
+    int loop_id = -1;
+    std::vector<int> bb1_non_loop_ids;
+    for (const int id : bb1_ids) {
+        if (instructions[id].kind == InstructionKind::Loop || instructions[id].kind == InstructionKind::LoopPip) {
+            loop_id = id;
+        } else {
+            bb1_non_loop_ids.push_back(id);
+        }
+    }
+
+    // Schedule BB1 instructions (except loop) ASAP from loop_beginning.
+    // Without loop.pip, the loop body has a single stage and the II equals the loop body length,
+    // so we don't need modulo scheduling or the SlotTable here.
+    for (const int id : bb1_non_loop_ids) {
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+
+        int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
+        earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
+        earliest = std::max(earliest, loop_beginning);
+
+        int cycle = earliest;
+        while (true) {
+            ensure_bundle_capacity(schedule, cycle);
+            if (can_place_in_bundle(schedule[cycle], entry.instruction_type)) break;
+            ++cycle;
+        }
+        place_in_bundle(schedule[cycle], entry.instruction_type, instructions[id].raw_text);
+        scheduled_cycle[id] = cycle;
+    }
+
+    // Place the loop instruction at the last occupied BB1 cycle (it must close the loop body)
+    int last_bb1_cycle = loop_beginning;
+    for (const int id : bb1_non_loop_ids) {
+        last_bb1_cycle = std::max(last_bb1_cycle, scheduled_cycle[id]);
+    }
+
+    int loop_cycle = last_bb1_cycle;
     while (true) {
-        SlotTable slot_table;
-        slot_table.init_reset(ii);
-        
-        // Reset BB1 scheduled cycles for this attempt
-        for (const int id : bb1_ids) {
-            scheduled_cycle[id] = -1;
+        ensure_bundle_capacity(schedule, loop_cycle);
+        if (can_place_in_bundle(schedule[loop_cycle], InstructionKind::Loop)) break;
+        ++loop_cycle;
+    }
+    place_in_bundle(schedule[loop_cycle], InstructionKind::Loop, instructions[loop_id].raw_text);
+    scheduled_cycle[loop_id] = loop_cycle;
+
+    int ii = loop_cycle - loop_beginning + 1;
+
+    // Check interloop constraints (equation 2). If violated, push the loop instruction down.
+    while (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table,
+                                            scheduled_cycle, kind_by_id, ii)) {
+        schedule[loop_cycle].BRANCH = "nop";
+        ++loop_cycle;
+        ensure_bundle_capacity(schedule, loop_cycle);
+        while (!can_place_in_bundle(schedule[loop_cycle], InstructionKind::Loop)) {
+            ++loop_cycle;
+            ensure_bundle_capacity(schedule, loop_cycle);
         }
-        
-        // Clear loop body bundles
-        for (int i = loop_beginning; i < static_cast<int>(schedule.size()); ++i) {
-            schedule[i] = Bundle();
-        }
-        
-        // Try to schedule all BB1 instructions with current II
-        if (try_bb1_schedule_with_ii(bb1_ids, is_bb1, analysis_index_by_id, analysis_table, schedule,
-                                     scheduled_cycle, kind_by_id, instructions, slot_table, ii, loop_beginning)) {
-            break;  // Success, exit retry loop
-        }
-        // If failed, ii was incremented in try_bb1_schedule_with_ii, so loop tries again
-        if (ii > 100) { // Sanity check to avoid infinite loops in case of bugs
+        place_in_bundle(schedule[loop_cycle], InstructionKind::Loop, instructions[loop_id].raw_text);
+        scheduled_cycle[loop_id] = loop_cycle;
+        ii = loop_cycle - loop_beginning + 1;
+
+        if (ii > 100) {
             throw std::runtime_error("Scheduling failed: exceeded reasonable II limit.");
         }
     }
