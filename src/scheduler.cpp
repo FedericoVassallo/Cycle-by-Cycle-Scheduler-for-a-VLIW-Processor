@@ -456,7 +456,7 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
         schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
     }
 
-    // Push loop_beginning past any BB0 latency tails to avoid bubbles (see Figure 9)
+    // Push loop_beginning past any BB0 latency tails to avoid bubbles 
     int loop_beginning = static_cast<int>(schedule.size());
 
     for (const int id : bb1_ids) {
