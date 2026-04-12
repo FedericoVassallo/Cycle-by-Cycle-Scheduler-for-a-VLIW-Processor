@@ -547,8 +547,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
             }
 
             int cycle = earliest;
-            while (true) {
-                if (cycle > loop_beginning + ii * 20) {
+            while (true) { 
+                if (cycle > loop_beginning + ii * 20) { // sanity check to avoid infinite loops in case of bugs (we allow to go up to 20 II windows after the loop beginning, which should be more than enough for any reasonable schedule)
                     failed = true;
                     break;
                 }
