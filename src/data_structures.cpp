@@ -317,3 +317,118 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
 
     return true;
 }
+
+std::string rebuild_instruction_text(const Instruction& instr, int new_dest, const std::vector<int>& new_sources) {
+    std::string text;
+
+    // add predicate prefix if present, e.g. "(p32) "
+    if (!instr.predicate_register.empty()) {
+        text += "(" + instr.predicate_register + ") ";
+    }
+
+    text += instr.opcode;
+
+    // nop has no operands
+    if (instr.kind == InstructionKind::Nop) {
+        return text;
+    }
+
+    // loop/loop.pip: the target address gets set separately by the caller
+    if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
+        text += " " + std::to_string(instr.loop_target);
+        return text;
+    }
+
+    // mov to LC or EC: nothing changes, keep original text
+    if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) {
+        return instr.raw_text;
+    }
+
+    // extracts the last comma-separated token from the original text
+    // used to preserve hex formatting of immediates like 0x1000
+    auto extract_original_immediate = [](const std::string& raw) -> std::string {
+        auto pos = raw.rfind(',');
+        if (pos == std::string::npos) return "";
+        std::string token = raw.substr(pos + 1);
+        size_t start = token.find_first_not_of(" \t");
+        size_t end = token.find_last_not_of(" \t");
+        if (start == std::string::npos) return "";
+        return token.substr(start, end - start + 1);
+    };
+
+    // extracts the offset part from a memory operand like "0x1000(x2)"
+    // we need this to preserve hex formatting of offsets
+    auto extract_original_offset = [](const std::string& raw) -> std::string {
+        auto paren = raw.rfind('(');
+        if (paren == std::string::npos || paren == 0) return "0";
+        size_t end = paren;
+        size_t start = end - 1;
+        while (start > 0 && raw[start] == ' ') start--;
+        size_t comma = raw.rfind(',', start);
+        size_t space = raw.rfind(' ', start);
+        size_t tok_start = 0;
+        if (comma != std::string::npos) tok_start = comma + 1;
+        if (space != std::string::npos && space > tok_start) tok_start = space + 1;
+        while (tok_start < end && raw[tok_start] == ' ') tok_start++;
+        return raw.substr(tok_start, end - tok_start);
+    };
+
+    // destination register
+    if (new_dest != -1) {
+        text += " x" + std::to_string(new_dest);
+    }
+
+    int src_idx = 0;
+
+    // mov dest, source_or_immediate
+    if (instr.kind == InstructionKind::Mov) {
+        if (instr.has_immediate) {
+            text += ", " + extract_original_immediate(instr.raw_text);
+        } else if (src_idx < static_cast<int>(new_sources.size())) {
+            text += ", x" + std::to_string(new_sources[src_idx]);
+            src_idx++;
+        }
+        return text;
+    }
+
+    // st source, offset(base) — no destination register
+    if (instr.kind == InstructionKind::St) {
+        // rebuild from scratch since st has no dest
+        text = instr.opcode;
+        if (!instr.predicate_register.empty()) {
+            text = "(" + instr.predicate_register + ") " + text;
+        }
+        if (src_idx < static_cast<int>(new_sources.size())) {
+            text += " x" + std::to_string(new_sources[src_idx]);
+            src_idx++;
+        }
+        if (instr.has_memory_operand && src_idx < static_cast<int>(new_sources.size())) {
+            text += ", " + extract_original_offset(instr.raw_text) + "(x" + std::to_string(new_sources[src_idx]) + ")";
+            src_idx++;
+        }
+        return text;
+    }
+
+    // ld dest, offset(base)
+    if (instr.kind == InstructionKind::Ld) {
+        if (instr.has_memory_operand && src_idx < static_cast<int>(new_sources.size())) {
+            text += ", " + extract_original_offset(instr.raw_text) + "(x" + std::to_string(new_sources[src_idx]) + ")";
+            src_idx++;
+        }
+        return text;
+    }
+
+    // arithmetic: add, addi, sub, mulu — dest, src1, src2_or_imm
+    if (src_idx < static_cast<int>(new_sources.size())) {
+        text += ", x" + std::to_string(new_sources[src_idx]);
+        src_idx++;
+    }
+    if (instr.has_immediate) {
+        text += ", " + extract_original_immediate(instr.raw_text);
+    } else if (src_idx < static_cast<int>(new_sources.size())) {
+        text += ", x" + std::to_string(new_sources[src_idx]);
+        src_idx++;
+    }
+
+    return text;
+}
