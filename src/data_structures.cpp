@@ -69,3 +69,251 @@ void SlotTable::reserve_resources(int actual_cycle, InstructionKind instr_kind) 
             break; // For unknown instruction types, do nothing
     }
 }
+
+// all instructions have latency = 1, except for mulu 
+int instruction_latency(InstructionKind kind) {
+    if (kind == InstructionKind::Mulu) {
+        return 3;
+    }
+    return 1;
+}
+
+// All these instructions belong to an ALU 
+bool is_alu_kind(InstructionKind kind) {
+    return kind == InstructionKind::Add || kind == InstructionKind::Addi ||
+           kind == InstructionKind::Sub || kind == InstructionKind::Mov;
+}
+
+// Adds one cycle to the schedule 
+bool ensure_bundle_capacity(std::vector<Bundle>& schedule, int cycle) {
+    if (cycle < 0) {
+        return false;
+    }
+    if (static_cast<int>(schedule.size()) <= cycle) {
+        schedule.resize(static_cast<size_t>(cycle + 1));
+    }
+    return true;
+}
+
+// Checks if an instructions can be placed in a bundle 
+bool can_place_in_bundle(const Bundle& bundle, InstructionKind kind) {
+    if (is_alu_kind(kind)) {
+        return bundle.ALU0 == "nop" || bundle.ALU1 == "nop";
+    }
+
+    switch (kind) {
+        case InstructionKind::Mulu:
+            return bundle.MUL == "nop";
+        case InstructionKind::Ld:
+        case InstructionKind::St:
+            return bundle.MEM == "nop";
+        case InstructionKind::Loop:
+        case InstructionKind::LoopPip:
+            return bundle.BRANCH == "nop";
+        default:
+            return false;
+    }
+}
+
+// Places instruntion in the bundle and returns true / false depending on if there was space or not
+bool place_in_bundle(Bundle& bundle, InstructionKind kind, const std::string& raw_text) {
+    // First we check if we have an ALU instruction (and we check if both the ALUs are occupied)
+    if (is_alu_kind(kind)) {
+        if (bundle.ALU0 == "nop") {
+            bundle.ALU0 = raw_text;
+            return true;
+        }
+        if (bundle.ALU1 == "nop") {
+            bundle.ALU1 = raw_text;
+            return true;
+        }
+        return false;
+    }
+
+    // Then we analyze all the other cases
+    switch (kind) {
+        case InstructionKind::Mulu:
+            if (bundle.MUL != "nop") {
+                return false;
+            }
+            bundle.MUL = raw_text;
+            return true;
+        case InstructionKind::Ld:
+        case InstructionKind::St:
+            if (bundle.MEM != "nop") {
+                return false;
+            }
+            bundle.MEM = raw_text;
+            return true;
+        case InstructionKind::Loop:
+        case InstructionKind::LoopPip:
+            if (bundle.BRANCH != "nop") {
+                return false;
+            }
+            bundle.BRANCH = raw_text;
+            return true;
+        default:
+            return false;
+    }
+}
+
+// returns the earliest ready cycle where we can schedule the instruction given the dependencies (the cycle when the producer was 
+// scheduled and the latency of the producer) 
+int max_ready_cycle(const std::vector<int>& deps,
+                    const std::vector<int>& scheduled_cycle,
+                    const std::vector<InstructionKind>& kind_by_id) {
+    int earliest = 0;
+    for (const int dep_id : deps) {
+        // these first two check are just sanity checks (to make sure data is valid)
+        if (dep_id < 0 || dep_id >= static_cast<int>(scheduled_cycle.size())) {
+            continue;
+        }
+        if (scheduled_cycle[dep_id] < 0) {
+            continue;
+        }
+        earliest = std::max(earliest, scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
+    }
+    return earliest;
+}
+
+// Checks loop-carried recurrence constraints after a full BB1 placement attempt.
+// For a distance-1 recurrence edge producer -> consumer:
+// consumer_cycle >= producer_cycle + latency(producer) - II
+bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
+                                     const std::vector<bool>& is_bb1,
+                                     const std::vector<int>& analysis_index_by_id,
+                                     const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                                     const std::vector<int>& scheduled_cycle,
+                                     const std::vector<InstructionKind>& kind_by_id,
+                                     int ii) {
+
+    for (const int id : bb1_ids) { // look at all the instr in BB1 (since only they can have interloop dependencies with other BB1 instructions)
+        // Sanity checks to ensure we have valid data before checking constraints
+        if (id < 0 || id >= static_cast<int>(analysis_index_by_id.size())) {
+            continue;
+        }
+
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) {
+            continue;
+        }
+
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        if (id < 0 || id >= static_cast<int>(scheduled_cycle.size()) || scheduled_cycle[id] < 0) {
+            continue;
+        }
+
+        for (const int dep_id : entry.interloop_dependencies) {
+            if (dep_id < 0 || dep_id >= static_cast<int>(scheduled_cycle.size())) {
+                continue;
+            }
+            if (scheduled_cycle[dep_id] < 0) {
+                continue;
+            }
+
+            // We check if the consumer is scheduled at least latency cycles after the producer, considering the modulo scheduling with II.
+            const int required_cycle = scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]) - ii;
+            // We need to check if the producer is in BB1 to understand if we need to apply the constraint 
+            // (if the producer is not in BB1, it means that it is scheduled outside the loop and we don't
+            // need to apply the constraint, since the consumer will always be scheduled after the producer)
+
+            if (scheduled_cycle[id] < required_cycle && is_bb1[dep_id]) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Schedules an entry (no modulo scheduling, used for BB0 and BB2 instructions)
+int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
+                             const std::vector<Instruction>& instructions,
+                             std::vector<Bundle>& schedule,
+                             std::vector<int>& scheduled_cycle,
+                             const std::vector<InstructionKind>& kind_by_id,
+                             const std::vector<int>& extra_dependencies = {}) {
+    int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
+    earliest = std::max(earliest, max_ready_cycle(extra_dependencies, scheduled_cycle, kind_by_id));
+
+    int cycle = earliest;
+    while (true) {
+        ensure_bundle_capacity(schedule, cycle);
+        if (can_place_in_bundle(schedule[cycle], entry.instruction_type)) {
+            break; // so if it is possible to place in the bundle, we break and get out of the while loop
+        }
+        ++cycle; // if is not possible, we try to place the instruction in the next cycle (we keep increasing the cycle until we find a cycle where we can place the instruction)
+    }
+
+    // we place the instruction in the bundle and we update the scheduled cycle for that instruction id
+    place_in_bundle(schedule[cycle], entry.instruction_type, instructions[entry.id].raw_text);
+    scheduled_cycle[entry.id] = cycle;
+    return cycle;
+}
+
+bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
+                              const std::vector<bool>& is_bb1,
+                              const std::vector<int>& analysis_index_by_id,
+                              const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                              std::vector<Bundle>& schedule,
+                              std::vector<int>& scheduled_cycle,
+                              const std::vector<InstructionKind>& kind_by_id,
+                              const std::vector<Instruction>& instructions,
+                              SlotTable& slot_table,
+                              int& ii,
+                              int loop_beginning) {
+    for (const int id : bb1_ids) {
+        // With the id we find the corresponding entry index in the analysis table 
+        const int entry_index = analysis_index_by_id[id];
+        if (entry_index < 0) {
+            continue;
+        }
+
+        // We extract the entry from the analysis table and we schedule it with modulo scheduling 
+        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+
+        // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
+        int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
+        earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
+
+        // BB1 instructions must stay inside the loop window [loop_beginning, loop_beginning + II).
+        earliest = std::max(earliest, loop_beginning);
+
+        // If earliest >= loop_beginning + ii, it means that we cannot schedule the instruction in the current II window, so we can already return false and increase II for the next scheduling attempt
+        if (earliest >= loop_beginning + ii) { 
+            ii++; 
+            return false;
+        }
+
+        int cycle = earliest;
+        while (true) {
+            if (cycle > 1000) { // Sanity check to avoid infinite loops in case of bugs
+                throw std::runtime_error("Scheduling failed: exceeded reasonable cycle limit.");
+            }
+            ensure_bundle_capacity(schedule, cycle);
+            if (slot_table.can_schedule(cycle, entry.instruction_type) &&
+                can_place_in_bundle(schedule[cycle], entry.instruction_type)) {
+                break;
+            }
+            ++cycle;
+            if (cycle >= loop_beginning + ii) { 
+                // Cannot fit instruction in current II window; signal failure and increase II
+                ii++;
+                return false;
+            }
+        }
+
+        place_in_bundle(schedule[cycle], entry.instruction_type, instructions[id].raw_text);
+        slot_table.reserve_resources(cycle, entry.instruction_type);
+        scheduled_cycle[id] = cycle;
+    }
+
+    // Validate loop-carried dependencies once all BB1 instructions have tentative cycles.
+    if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table, scheduled_cycle, kind_by_id, ii)) {
+        ii++;
+        return false;
+    }
+    // If we reach this point, the scheduling was successful with the current II, considering all possible dependencies and resource constraints.
+
+    return true;
+}
