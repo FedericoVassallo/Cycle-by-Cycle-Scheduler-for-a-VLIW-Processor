@@ -257,7 +257,8 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
 // version using loop (without loop.pip)
 void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                          std::vector<Bundle>& schedule,
-                         const std::vector<Instruction>& instructions) {
+                         const std::vector<Instruction>& instructions,
+                         std::vector<int>& scheduled_cycle);
     
     // We clear the schedule vector for rubustness (already supposed to be empty)
     schedule.clear();
