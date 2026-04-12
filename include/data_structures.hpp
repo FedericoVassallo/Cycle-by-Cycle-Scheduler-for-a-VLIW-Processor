@@ -85,6 +85,14 @@ struct SlotTable {
     void reserve_resources(int actual_cycle, InstructionKind instr_kind);
 };
 
+// shared helpers used by both the scheduler and register allocation
+int instruction_latency(InstructionKind kind);
+bool is_alu_kind(InstructionKind kind);
+bool ensure_bundle_capacity(std::vector<Bundle>& schedule, int cycle);
+bool can_place_in_bundle(const Bundle& bundle, InstructionKind kind);
+bool place_in_bundle(Bundle& bundle, InstructionKind kind, const std::string& raw_text);
+
+// reconstructs instruction text from parsed fields and new register assignments
+std::string rebuild_instruction_text(const Instruction& instr, int new_dest, const std::vector<int>& new_sources);
+
 #endif // DATA_STRUCTURES_HPP
-
-
