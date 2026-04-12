@@ -49,7 +49,7 @@ bool can_place_in_bundle(const Bundle& bundle, InstructionKind kind) {
     }
 }
 
-// Places instruntion in the bundle and returns true / false depending on the output 
+// Places instruntion in the bundle and returns true / false depending on if there was space or not
 bool place_in_bundle(Bundle& bundle, InstructionKind kind, const std::string& raw_text) {
     // First we check if we have an ALU instruction (and we check if both the ALUs are occupied)
     if (is_alu_kind(kind)) {
@@ -98,6 +98,7 @@ int max_ready_cycle(const std::vector<int>& deps,
                     const std::vector<InstructionKind>& kind_by_id) {
     int earliest = 0;
     for (const int dep_id : deps) {
+        // these first two check are just sanity checks (to make sure data is valid)
         if (dep_id < 0 || dep_id >= static_cast<int>(scheduled_cycle.size())) {
             continue;
         }
@@ -120,8 +121,8 @@ bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
                                      const std::vector<InstructionKind>& kind_by_id,
                                      int ii) {
 
-    // Sanity checks to ensure we have valid data before checking constraints
-    for (const int id : bb1_ids) {
+    for (const int id : bb1_ids) { // look at all the instr in BB1 (since only they can have interloop dependencies with other BB1 instructions)
+        // Sanity checks to ensure we have valid data before checking constraints
         if (id < 0 || id >= static_cast<int>(analysis_index_by_id.size())) {
             continue;
         }
@@ -173,11 +174,12 @@ int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
     while (true) {
         ensure_bundle_capacity(schedule, cycle);
         if (can_place_in_bundle(schedule[cycle], entry.instruction_type)) {
-            break;
+            break; // so if it is possible to place in the bundle, we break and get out of the while loop
         }
-        ++cycle;
+        ++cycle; // if is not possible, we try to place the instruction in the next cycle (we keep increasing the cycle until we find a cycle where we can place the instruction)
     }
 
+    // we place the instruction in the bundle and we update the scheduled cycle for that instruction id
     place_in_bundle(schedule[cycle], entry.instruction_type, instructions[entry.id].raw_text);
     scheduled_cycle[entry.id] = cycle;
     return cycle;
@@ -272,6 +274,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     std::vector<int> bb0_ids;
     std::vector<int> bb1_ids;
     std::vector<int> bb2_ids;
+    // this is a vector of boolean of lenght = instr count and that initially is set to false
     std::vector<bool> is_bb1(instruction_count, false); // To quickly check if an instruction belongs to BB1
 
     // We analyse all the instructions in the dependency analysis table to allocate them in the different basic blocks and to extract useful information for 
@@ -432,13 +435,16 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     std::vector<int> bb2_ids;
     std::vector<bool> is_bb1(instruction_count, false);
 
+    // the for iterates over the lenght of the analysis table
     for (int analysis_index = 0; analysis_index < static_cast<int>(analysis_table.size()); ++analysis_index) {
+        // just a shortcut to write entry instead of analysis_table[analysis_index] every time
         const DependencyAnalysisTableEntry& entry = analysis_table[analysis_index];
-        if (entry.id < 0 || entry.id >= instruction_count) continue;
+        if (entry.id < 0 || entry.id >= instruction_count) continue; // Sanity check
 
         analysis_index_by_id[entry.id] = analysis_index;
         kind_by_id[entry.id] = entry.instruction_type;
 
+        // depending on the bb type it belongs we put in the corrisponding vector
         switch (instructions[entry.id].basic_block) {
             case BasicBlock::BB0: bb0_ids.push_back(entry.id); break;
             case BasicBlock::BB1: bb1_ids.push_back(entry.id); is_bb1[entry.id] = true; break;
