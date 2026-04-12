@@ -314,30 +314,31 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
     }
 
-    // Push loop_beginning past any BB0 latency tails to avoid bubbles at the start of the loop body (see Figure 9)
+    // this is an optimistic ipothesis to put the loop beginning exactly after the last BB0 instr
+    // if needed we will update it later
     int loop_beginning = static_cast<int>(schedule.size());
 
-    for (const int id : bb1_ids) {
+    for (const int id : bb1_ids) { // iterate for all the bb1
         const int entry_index = analysis_index_by_id[id];
         if (entry_index < 0) continue;
         const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
 
-        int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id);
-        for (const int dep_id : entry.interloop_dependencies) {
+        int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id); // we check the loop invariant dependencies to understand if we can already schedule the instruction at the loop beginning or if we need to push the loop beginning later
+        for (const int dep_id : entry.interloop_dependencies) { // iterate for all the interloop dependencies
             if (dep_id >= 0 && dep_id < instruction_count &&
                 instructions[dep_id].basic_block == BasicBlock::BB0 &&
                 scheduled_cycle[dep_id] >= 0) {
                 bb0_ready = std::max(bb0_ready, scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
             }
         }
-        loop_beginning = std::max(loop_beginning, bb0_ready);
+        loop_beginning = std::max(loop_beginning, bb0_ready); // we update the loop beginning if we find an instruction that cannot be scheduled at the current loop beginning (because of dependencies with BB0 instructions)
     }
 
-    if (loop_beginning > 0) {
-        ensure_bundle_capacity(schedule, loop_beginning - 1);
+    if (loop_beginning > 0) { 
+        ensure_bundle_capacity(schedule, loop_beginning - 1); // if needed it makes the schedule vector longer to accomodate the loop beginning by adding empty bundles (filled with "nop")
     }
 
-    // Separate the loop instruction from the other BB1 instructions
+    // Separate the loop instruction from the other BB1 instructions since the loop instruction has to be scheduled at the end
     int loop_id = -1;
     std::vector<int> bb1_non_loop_ids;
     for (const int id : bb1_ids) {
@@ -353,14 +354,16 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // so we don't need modulo scheduling or the SlotTable here.
     for (const int id : bb1_non_loop_ids) {
         const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) continue;
+        if (entry_index < 0) continue; // sanity check
         const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
 
+        // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
         earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
         earliest = std::max(earliest, loop_beginning);
 
         int cycle = earliest;
+        // iteratively look for the first cycle where we can place the instruction (checking bundle capacity) and place the instruction there
         while (true) {
             ensure_bundle_capacity(schedule, cycle);
             if (can_place_in_bundle(schedule[cycle], entry.instruction_type)) break;
@@ -370,7 +373,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         scheduled_cycle[id] = cycle;
     }
 
-    // Place the loop instruction at the last occupied BB1 cycle (it must close the loop body)
+    // here it search for the last cycle where we scheduled a BB1 instruction
     int last_bb1_cycle = loop_beginning;
     for (const int id : bb1_non_loop_ids) {
         last_bb1_cycle = std::max(last_bb1_cycle, scheduled_cycle[id]);
@@ -456,6 +459,7 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
 
     // BB0 scheduling
     for (const int id : bb0_ids) {
+
         const int entry_index = analysis_index_by_id[id];
         if (entry_index < 0) continue;
         const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
@@ -498,16 +502,16 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     // BB1 modulo scheduling with increasing II
     int ii = std::max(1, calculate_II_res(instructions));
 
-    while (true) {
+    while (true) { // we will keep trying to schedule BB1 instructions with increasing II until we find a valid schedule that satisfies all constraints and so break
         SlotTable slot_table;
-        slot_table.init_reset(ii);
+        slot_table.init_reset(ii); // we reset and initialize the slot table for the new II
 
         for (const int id : bb1_ids) {
-            scheduled_cycle[id] = -1;
+            scheduled_cycle[id] = -1; // we reset the scheduled cycle for all the BB1 instructions since we will try to reschedule them with the new II
         }
-        schedule.resize(loop_beginning);
+        schedule.resize(loop_beginning); // we reset the schedule to the loop beginning, since all the BB1 instructions will be rescheduled starting from the loop beginning (we keep the BB0 instructions that are before the loop beginning)
 
-        bool failed = false;
+        bool failed = false; // this flag will be set to true if we find an instruction that cannot be scheduled with the current II, so we have to try again with a higher II
 
         for (const int id : bb1_non_loop_ids) {
             const int entry_index = analysis_index_by_id[id];
@@ -522,11 +526,47 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
             // already scheduled in BB1, using equation 2 rearranged as a lower bound
             // on the consumer cycle. Skip BB0 producers and unscheduled producers.
 
-            // TODO: find the first cycle >= earliest where both the SlotTable allows
-            // scheduling (modulo resource check) and the bundle has a free slot.
-            // Unlike basic, there is no upper cycle bound since instructions can
-            // span multiple stages. Place the instruction and reserve resources.
-            // If you want, you can set a sanity-check upper bound and set failed=true.
+            for (const int dep_id : entry.interloop_dependencies) { // we iterate for all the interloop dependencies to check if they are scheduled in BB1 and if they are scheduled we apply the equation 2 to update the earliest cycle where we can schedule the instruction
+                // saity check
+                if (dep_id < 0 || dep_id >= instruction_count) continue;
+
+                // we skip the bb0 producers 
+                if (!is_bb1[dep_id]) continue;
+
+                // we skip if the producer is not skeduled yet (it means that the producer is after the consumer in program order, so we will check the constraint later when we will have scheduled the producer)
+                if (scheduled_cycle[dep_id] < 0) continue;
+
+                // we apply the equation 2 to update the earliest cycle where we can schedule the instruction based on the producer cycle, the producer latency and the current II 
+                int prod_cycle = scheduled_cycle[dep_id];
+                int prod_latency = instruction_latency(kind_by_id[dep_id]);
+                
+                int min_cycle_required = prod_cycle + prod_latency - ii;
+                
+                // we update the earliest
+                earliest = std::max(earliest, min_cycle_required);
+            }
+
+            int cycle = earliest;
+            while (true) {
+                if (cycle > loop_beginning + ii * 20) {
+                    failed = true;
+                    break;
+                }
+                ensure_bundle_capacity(schedule, cycle);
+                bool hardware_is_free = slot_table.can_schedule(cycle, entry.instruction_type);
+                bool text_bundle_is_free = can_place_in_bundle(schedule[cycle], entry.instruction_type);
+                if (hardware_is_free && text_bundle_is_free) {
+                    break;
+                }
+                ++cycle;
+            }
+            if (failed) {
+                break;
+            }
+
+            place_in_bundle(schedule[cycle], entry.instruction_type, instructions[id].raw_text);
+            slot_table.reserve_resources(cycle, entry.instruction_type);
+            scheduled_cycle[id] = cycle;
         }
 
         if (failed) {
@@ -547,11 +587,48 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
         break;
     }
 
-    // TODO: place loop.pip in the Branch slot at the last bundle of the first stage,
-    // and update its loop target to point to loop_beginning
+    // At this point, we have successfully scheduled all BB1 instructions (except the loop instruction) with a valid II. 
+    // Now we just need to place the loop instruction 
+    // it must be the last bundle of the first II window.
+    int loop_cycle = loop_beginning + ii - 1;
 
-    // TODO: compute the number of stages and each instruction's stage index —
-    // these will be needed later for register allocation and predication
+    ensure_bundle_capacity(schedule, loop_cycle); // Ensure the row exists 
+
+    // place the instruction in the BRANCH slot of that specific bundle.
+    place_in_bundle(schedule[loop_cycle], InstructionKind::LoopPip, instructions[loop_id].raw_text);
+
+    // record its position 
+    scheduled_cycle[loop_id] = loop_cycle;
+
+    // We need to know how many stages each instruction "slips" forward.
+    // This is essential for:
+    // - Predication: To know which stage predicate (P0, P1, ...) controls the instruction.
+    // - Register Allocation: To handle rotating registers correctly.
+
+    std::vector<int> stage_by_id(instruction_count, -1);
+    int max_stage = 0;
+
+    for (const int id : bb1_ids) {
+        int cycle = scheduled_cycle[id];
+        
+        // We only care about instructions that are actually part of the loop body
+        if (cycle >= loop_beginning) {
+            
+            // The stage index is how many II-windows the instruction has shifted 
+            // away from the start of its own iteration.
+            int relative_cycle = cycle - loop_beginning;
+            int stage = relative_cycle / ii; 
+            
+            stage_by_id[id] = stage;
+            
+            if (stage > max_stage) {
+                max_stage = stage;
+            }
+        }
+    }
+
+    // The total number of stages is the index of the last stage + 1
+    int num_stages = max_stage + 1;
 
     // BB2 scheduling
     for (const int id : bb2_ids) {
