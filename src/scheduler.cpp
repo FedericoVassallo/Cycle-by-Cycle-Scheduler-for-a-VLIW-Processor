@@ -6,7 +6,7 @@
 void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                          std::vector<Bundle>& schedule,
                          const std::vector<Instruction>& instructions,
-                         std::vector<int>& scheduled_cycle);
+                         std::vector<int>& scheduled_cycle) {
     
     // We clear the schedule vector for rubustness (already supposed to be empty)
     schedule.clear();
@@ -48,8 +48,8 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         }
     }
 
-    // Preallocate the schedule cycles vector
-    std::vector<int> scheduled_cycle(static_cast<size_t>(instruction_count), -1);
+    // Reset the scheduled_cycle vector
+    scheduled_cycle.assign(static_cast<size_t>(instruction_count), -1);
 
     // BB0 contains setup code, scheduled once before the loop body.
     for (const int id : bb0_ids) {
@@ -158,23 +158,78 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         }
     }
 
-    // BB2 executes after the loop, so it must respect both local and post-loop dependencies.
-    for (const int id : bb2_ids) {
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) {
-            continue;
+    // BB2 is NOT scheduled here — alloc_b may push the loop instruction down
+    // so we don't know the final loop position yet.
+    // schedule_bb2() will handle it after alloc_b finishes.
+}
+
+// schedules BB2 instructions after the final loop position is known
+// called after alloc_b since alloc_b can push the loop instruction down
+void schedule_bb2(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                  std::vector<Bundle>& schedule,
+                  const std::vector<Instruction>& instructions,
+                  std::vector<int>& scheduled_cycle) {
+
+    const int instruction_count = static_cast<int>(instructions.size());
+
+    // we need analysis_index_by_id and kind_by_id just like in the other schedulers
+    std::vector<int> analysis_index_by_id(instruction_count, -1);
+    std::vector<InstructionKind> kind_by_id(instruction_count, InstructionKind::Unknown);
+    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
+        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
+            analysis_index_by_id[analysis_table[i].id] = i;
+            kind_by_id[analysis_table[i].id] = analysis_table[i].instruction_type;
         }
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+    }
+
+    // find the loop instruction's final cycle so we know where BB2 starts
+    int loop_cycle = -1;
+    for (int i = 0; i < instruction_count; ++i) {
+        if (instructions[i].kind == InstructionKind::Loop || instructions[i].kind == InstructionKind::LoopPip) {
+            loop_cycle = scheduled_cycle[i];
+        }
+    }
+
+    // BB2 must start after the loop instruction
+    int bb2_start = (loop_cycle >= 0) ? loop_cycle + 1 : static_cast<int>(schedule.size());
+
+    // schedule each BB2 instruction using the same schedule_entry_no_modulo we use for BB0
+    // but with a minimum cycle of bb2_start and post-loop + loop-invariant dependencies
+    for (int i = 0; i < instruction_count; ++i) {
+        if (instructions[i].basic_block != BasicBlock::BB2) continue;
+        const int ai = analysis_index_by_id[i];
+        if (ai < 0) continue;
+
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+
+        // BB2 depends on post-loop producers (BB1 instructions from the last iteration)
+        // and possibly loop-invariant producers (BB0 instructions)
         std::vector<int> deps = entry.post_loop_dependencies;
         deps.insert(deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
-        schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id, deps);
+
+        // compute the earliest cycle from dependencies
+        int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
+        earliest = std::max(earliest, max_ready_cycle(deps, scheduled_cycle, kind_by_id));
+        // but never before bb2_start
+        earliest = std::max(earliest, bb2_start);
+
+        // find a cycle with a free slot
+        int cycle = earliest;
+        while (true) {
+            ensure_bundle_capacity(schedule, cycle);
+            if (can_place_in_bundle(schedule[cycle], entry.instruction_type)) break;
+            ++cycle;
+        }
+        place_in_bundle(schedule[cycle], entry.instruction_type, instructions[i].raw_text);
+        scheduled_cycle[i] = cycle;
     }
 }
 
 // version using loop.pip
 void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                             std::vector<Bundle>& schedule,
-                            const std::vector<Instruction>& instructions) {
+                            const std::vector<Instruction>& instructions,
+                            std::vector<int>& scheduled_cycle) {
 
     schedule.clear();
     const int instruction_count = static_cast<int>(instructions.size());
@@ -204,7 +259,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
         }
     }
 
-    std::vector<int> scheduled_cycle(static_cast<size_t>(instruction_count), -1);
+    // reset scheduled_cycle
+    scheduled_cycle.assign(static_cast<size_t>(instruction_count), -1);
 
     // BB0 scheduling
     for (const int id : bb0_ids) {
@@ -379,15 +435,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     // The total number of stages is the index of the last stage + 1
     int num_stages = max_stage + 1;
 
-    // BB2 scheduling
-    for (const int id : bb2_ids) {
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
-        std::vector<int> deps = entry.post_loop_dependencies;
-        deps.insert(deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
-        schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id, deps);
-    }
+    // BB2 is NOT scheduled here for the same reason as schedule_ASAP_basic:
+    // alloc_r may modify the loop position, so schedule_bb2 handles it after allocation
 }
 
 int calculate_II_res(const std::vector<Instruction>& instructions) {
