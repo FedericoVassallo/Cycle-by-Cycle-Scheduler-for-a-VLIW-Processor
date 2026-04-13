@@ -517,156 +517,500 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
     // ========================================================================
     // PHASE 1: assign rotating registers to BB1 destinations
     // ========================================================================
-    // TODO: Unlike alloc_b which assigns x1, x2, x3... to all instructions,
-    // alloc_r only assigns registers to BB1 instructions here.
-    // BB1 destinations get ROTATING registers starting from x32.
-    //
-    // The spacing between consecutive rotating registers is (num_stages + 1).
-    // This is because a value produced in one iteration might still be alive
-    // in the next iteration. With K stages, the RRB register gets incremented
-    // K times between when a value is produced and when it might last be read.
-    // So we need (num_stages + 1) physical registers per logical register to
-    // avoid conflicts. For example with 2 stages: x32, x35, x38, x41...
-    // (spacing of 3 = 2 + 1).
-    //
-    // Walk BB1 instructions in scheduling order (from ordered_ids, filtering
-    // for BB1 only). Skip loop/loop.pip, st, and mov to LC/EC just like alloc_b.
-    // For each instruction that produces a register, assign the next rotating
-    // register. Keep a counter starting at 32 and increment by (num_stages + 1)
-    // each time.
-    //
-    // Store results in new_dest_reg[id] as before.
-    // Also store stage_by_id[id] for each instruction — you'll need it in Phase 3.
-
-    int next_rotating_reg = 32;
+    // BB1 destinations get rotating registers starting from x32
+    // spaced by (num_stages + 1) to avoid conflicts across iterations
     int rotating_stride = num_stages + 1;
+    int next_rotating_reg = 32;
 
-    // TODO: loop through ordered_ids, assign rotating regs to BB1 destinations
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        const Instruction& instr = instructions[id];
 
+        // same skips as alloc_b
+        if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) continue;
+        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
+        if (instr.kind == InstructionKind::St) continue;
+
+        if (instr.destination_register != -1) {
+            new_dest_reg[id] = next_rotating_reg;
+            next_rotating_reg += rotating_stride;
+        }
+    }
 
     // ========================================================================
     // PHASE 2: assign static registers to loop invariants
     // ========================================================================
-    // TODO: Loop invariant values are produced in BB0 and consumed in BB1
-    // but never change during the loop. They don't need rotating registers —
-    // a simple static register is enough.
-    //
-    // Walk through the analysis table and find all BB1 instructions that have
-    // loop_invariant_dependencies. For each loop invariant producer (a BB0
-    // instruction), assign a static register starting from x1.
-    //
-    // Be careful not to assign the same BB0 instruction twice if multiple
-    // BB1 consumers reference it.
-    //
-    // Store results in new_dest_reg[id] for the BB0 producer.
-    //
-    // Note: some BB0 instructions are BOTH loop invariant AND interloop
-    // (because dependency_analysis reclassifies them). Those should NOT
-    // get a static register here — they'll be handled in Phase 4 as
-    // interloop initializers. You can check: if a BB0 instruction appears
-    // in any BB1 instruction's interloop_dependencies, skip it here.
-
+    // loop invariant producers are BB0 instructions that feed BB1 but whose
+    // value never changes during the loop. they get simple static registers.
+    // however if a BB0 instruction is also an interloop initializer (it appears
+    // in some BB1 instruction's interloop_dependencies), we skip it here —
+    // it gets handled in Phase 4 with rotation offsets.
     int next_static_reg = 1;
 
-    // TODO: loop through BB1 instructions, find loop invariant producers, assign static regs
+    // first build a set of BB0 instruction ids that appear in interloop deps
+    // these are interloop initializers, not pure loop invariants.
+    // IMPORTANT: when multiple BB0 instructions write the same register and all
+    // appear in interloop_dependencies, only the LAST one (latest in program order)
+    // is the actual initializer. Earlier ones just feed later BB0 instructions.
+    std::vector<bool> is_interloop_initializer(instruction_count, false);
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
 
+        // group BB0 interloop deps by the register they write
+        // only the latest one per register is the true initializer
+        std::map<int, int> latest_bb0_per_reg; // dest_register -> latest BB0 instruction id
+        for (const int dep_id : entry.interloop_dependencies) {
+            if (dep_id < 0 || dep_id >= instruction_count) continue;
+            if (instructions[dep_id].basic_block != BasicBlock::BB0) continue;
+            int dreg = instructions[dep_id].destination_register;
+            if (dreg < 0) continue;
+            if (latest_bb0_per_reg.find(dreg) == latest_bb0_per_reg.end() || dep_id > latest_bb0_per_reg[dreg]) {
+                latest_bb0_per_reg[dreg] = dep_id;
+            }
+        }
+        for (const auto& kv : latest_bb0_per_reg) {
+            is_interloop_initializer[kv.second] = true;
+        }
+    }
+
+    // now assign static regs to pure loop invariant producers
+    // track which BB0 ids we've already assigned to avoid duplicates
+    std::vector<bool> invariant_assigned(instruction_count, false);
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+
+        for (const int dep_id : entry.loop_invariant_dependencies) {
+            if (dep_id < 0 || dep_id >= instruction_count) continue;
+            if (instructions[dep_id].basic_block != BasicBlock::BB0) continue;
+            // skip if this BB0 instruction is also an interloop initializer
+            if (is_interloop_initializer[dep_id]) continue;
+            // skip if already assigned
+            if (invariant_assigned[dep_id]) continue;
+
+            new_dest_reg[dep_id] = next_static_reg;
+            next_static_reg++;
+            invariant_assigned[dep_id] = true;
+        }
+    }
 
     // ========================================================================
-    // PHASE 3: link source operands using stage/iteration offsets
+    // PHASE 3: link BB1 source operands using stage/iteration offsets
     // ========================================================================
-    // TODO: This is the biggest difference from alloc_b. Instead of just
-    // looking up new_dest_reg[producer], we need to apply register rotation
-    // offsets based on equations 3 and 4 from the PDF.
-    //
-    // For each BB1 instruction's source operand, find its producer and then:
-    //
-    // A) If the producer is a LOOP INVARIANT (BB0, static register):
-    //    Just use new_dest_reg[producer] directly. No offset needed because
-    //    static registers don't rotate.
-    //
-    // B) If the producer is a LOCAL dependency (same BB1, same iteration):
-    //    Apply equation 3: consumed_reg = produced_reg + (St(consumer) - St(producer))
-    //    where St(X) is the stage of instruction X.
-    //    The stage difference accounts for RRB increments between producer and consumer.
-    //    Since the producer is always before the consumer in the same iteration,
-    //    the difference is always >= 0.
-    //
-    // C) If the producer is an INTERLOOP dependency (BB1, previous iteration):
-    //    Apply equation 4: consumed_reg = produced_reg + (St(consumer) - St(producer)) + 1
-    //    The +1 accounts for the extra RRB increment when going from one iteration
-    //    to the next.
-    //
-    //    If the interloop producer is in BB0 (an initializer that was reclassified),
-    //    this is handled in Phase 4, not here.
-    //
-    // For BB0 and BB2 instructions, handle them the same way as alloc_b for now
-    // (they'll be finalized in Phase 4).
-    //
-    // Walk ordered_ids, and for each instruction's source registers:
-    // 1. Look up the dependency table to find the producer
-    // 2. Determine which category (A, B, or C) it falls into
-    // 3. Compute the final register number with the appropriate offset
-    // 4. Store in new_source_regs[id]
+    // for each BB1 instruction's source, find the producer and apply:
+    //   loop invariant -> just use the static register from Phase 2
+    //   local dep (same iteration) -> equation 3: reg + (St(consumer) - St(producer))
+    //   interloop dep (prev iteration, BB1 producer) -> equation 4: reg + (St(consumer) - St(producer)) + 1
+    //   interloop dep pointing to BB0 initializer -> skip here, resolved via the BB0 dest in Phase 4
 
-    // TODO: implement the operand linking with rotation offsets
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        const int ai = analysis_index_by_id[id];
 
+        if (ai < 0 || instr.source_registers.empty()) {
+            new_source_regs[id] = {};
+            continue;
+        }
+
+        // BB0 and BB2 operands are handled in Phase 4
+        if (instr.basic_block != BasicBlock::BB1) {
+            // placeholder — Phase 4 will fill these
+            for (int s = 0; s < static_cast<int>(instr.source_registers.size()); ++s) {
+                new_source_regs[id].push_back(-1);
+            }
+            continue;
+        }
+
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        int consumer_stage = stage_by_id[id];
+
+        for (const int src_reg : instr.source_registers) {
+            int resolved_reg = -1;
+
+            // check loop invariant dependencies first
+            for (const int dep_id : entry.loop_invariant_dependencies) {
+                if (dep_id < 0 || dep_id >= instruction_count) continue;
+                if (instructions[dep_id].destination_register != src_reg) continue;
+                // pure loop invariant — use static register directly
+                if (new_dest_reg[dep_id] != -1) {
+                    resolved_reg = new_dest_reg[dep_id];
+                }
+                break;
+            }
+
+            // check local dependencies (same iteration, same BB1)
+            if (resolved_reg == -1) {
+                for (const int dep_id : entry.local_dependencies) {
+                    if (dep_id < 0 || dep_id >= instruction_count) continue;
+                    if (instructions[dep_id].destination_register != src_reg) continue;
+                    if (new_dest_reg[dep_id] == -1) continue;
+
+                    int producer_stage = stage_by_id[dep_id];
+                    // equation 3: produced_reg + (St(consumer) - St(producer))
+                    resolved_reg = new_dest_reg[dep_id] + (consumer_stage - producer_stage);
+                    break;
+                }
+            }
+
+            // check interloop dependencies (previous iteration)
+            if (resolved_reg == -1) {
+                for (const int dep_id : entry.interloop_dependencies) {
+                    if (dep_id < 0 || dep_id >= instruction_count) continue;
+                    if (instructions[dep_id].destination_register != src_reg) continue;
+
+                    if (instructions[dep_id].basic_block == BasicBlock::BB1) {
+                        if (new_dest_reg[dep_id] == -1) continue;
+                        int producer_stage = stage_by_id[dep_id];
+                        // equation 4: produced_reg + (St(consumer) - St(producer)) + 1
+                        resolved_reg = new_dest_reg[dep_id] + (consumer_stage - producer_stage) + 1;
+                        break;
+                    }
+                    // BB0 interloop initializer — the consumer reads the same register
+                    // as the BB1 interloop producer but with the +1 offset.
+                    // we need to find the corresponding BB1 producer for this register.
+                    if (instructions[dep_id].basic_block == BasicBlock::BB0) {
+                        // find the BB1 instruction that also produces this register
+                        // (it's in the interloop deps too)
+                        for (const int other_dep : entry.interloop_dependencies) {
+                            if (other_dep < 0 || other_dep >= instruction_count) continue;
+                            if (instructions[other_dep].destination_register != src_reg) continue;
+                            if (instructions[other_dep].basic_block == BasicBlock::BB1) {
+                                if (new_dest_reg[other_dep] == -1) continue;
+                                int producer_stage = stage_by_id[other_dep];
+                                // same as equation 4
+                                resolved_reg = new_dest_reg[other_dep] + (consumer_stage - producer_stage) + 1;
+                                break;
+                            }
+                        }
+                        if (resolved_reg != -1) break;
+                    }
+                }
+            }
+
+            new_source_regs[id].push_back(resolved_reg);
+        }
+    }
 
     // ========================================================================
     // PHASE 4: allocate BB0 and BB2 registers
     // ========================================================================
-    // TODO: Handle the remaining register assignments for BB0 and BB2.
-    // The PDF (Section 3.3.2, fourth phase) lists these cases:
-    //
-    // CASE A — BB0 interloop initializer:
-    //   If a BB0 instruction writes to a register that is an interloop
-    //   dependent operand of some BB1 instruction C, and a BB1 instruction P
-    //   also produces that operand within the loop body, then:
-    //   - The BB0 instruction's destination = same base register as P's destination
-    //   - iteration_offset = +1
-    //   - stage_offset = -St(P)
-    //   - So the actual register = dest_of_P + 1 + (-St(P)) = dest_of_P + 1 - St(P)
-    //   This makes the BB0 value land in exactly the right rotated position
-    //   so that BB1 consumers read it correctly on the first iteration.
-    //
-    // CASE B — BB0/BB2 local dependency:
-    //   If a BB0 or BB2 instruction has a local dependency within BB0 or BB2,
-    //   assign registers the same way as alloc_b (fresh unique static registers).
-    //   But only if the destination wasn't already assigned in Phase 1 or 2.
-    //
-    // CASE C — BB2 post-loop dependency:
-    //   If a BB2 instruction consumes a register produced in BB1, the value
-    //   comes from the last iteration. The iteration offset is 0 (no new
-    //   iteration started), and the stage offset is the distance from the
-    //   producer's stage to the last stage: (num_stages - 1) - St(producer).
-    //   So: consumed_reg = produced_reg + 0 + ((num_stages - 1) - St(producer))
-    //     = produced_reg + num_stages - 1 - St(producer)
-    //
-    // CASE D — BB0/BB2 reads a loop invariant:
-    //   Just use the static register assigned in Phase 2.
-    //
-    // CASE E — Orphan operands (no producer):
-    //   Same as alloc_b Phase 4: assign a fresh unused static register.
-    //   If two instructions read the same orphan, give them the same register.
 
-    // TODO: implement BB0/BB2 register allocation
+    // CASE A: BB0 interloop initializers
+    // if a BB0 instruction is an interloop initializer, its dest register
+    // must match the BB1 producer's register with offsets so that the first
+    // iteration reads the correct value
+    for (int id = 0; id < instruction_count; ++id) {
+        if (instructions[id].basic_block != BasicBlock::BB0) continue;
+        if (!is_interloop_initializer[id]) continue;
+        if (new_dest_reg[id] != -1) continue; // already assigned
 
+        int orig_dest = instructions[id].destination_register;
+        if (orig_dest == -1) continue;
 
-    // ========================================================================
-    // BUNDLE REWRITE: same as alloc_b
-    // ========================================================================
-    // rewrite BB0 and BB1 bundle slots with new register names
-    // skip BB2 (handled by rewrite_bb2_bundles after schedule_bb2)
+        // find the BB1 instruction that produces the same register and is
+        // listed as an interloop dependency consumer of this BB0 instruction
+        for (const int consumer_id : ordered_ids) {
+            if (instructions[consumer_id].basic_block != BasicBlock::BB1) continue;
+            const int ai = analysis_index_by_id[consumer_id];
+            if (ai < 0) continue;
+            const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+
+            for (const int dep_id : entry.interloop_dependencies) {
+                if (dep_id != id) continue; // we want the entry that lists THIS bb0 instruction
+
+                // now find the BB1 producer of the same register in the interloop deps
+                for (const int other_dep : entry.interloop_dependencies) {
+                    if (other_dep < 0 || other_dep >= instruction_count) continue;
+                    if (instructions[other_dep].basic_block != BasicBlock::BB1) continue;
+                    if (instructions[other_dep].destination_register != orig_dest) continue;
+                    if (new_dest_reg[other_dep] == -1) continue;
+
+                    int producer_stage = stage_by_id[other_dep];
+                    // dest = produced_reg + 1 - St(producer)
+                    new_dest_reg[id] = new_dest_reg[other_dep] + 1 - producer_stage;
+                    goto done_bb0_initializer;
+                }
+            }
+        }
+        done_bb0_initializer:;
+    }
+
+    // CASE B: BB0 instructions with local dependencies that haven't been assigned yet
+    // (non-interloop, non-invariant BB0 instructions like "mov LC, 100")
+    // assign them static registers if they have a dest
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB0) continue;
+        if (new_dest_reg[id] != -1) continue; // already assigned
+        const Instruction& instr = instructions[id];
+        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
+        if (instr.kind == InstructionKind::St) continue;
+        if (instr.destination_register != -1) {
+            new_dest_reg[id] = next_static_reg;
+            next_static_reg++;
+        }
+    }
+
+    // BB2 destinations — assign static regs
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB2) continue;
+        if (new_dest_reg[id] != -1) continue;
+        const Instruction& instr = instructions[id];
+        if (instr.kind == InstructionKind::St) continue;
+        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
+        if (instr.destination_register != -1) {
+            new_dest_reg[id] = next_static_reg;
+            next_static_reg++;
+        }
+    }
+
+    // now resolve BB0 and BB2 source operands
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
-        if (instr.basic_block == BasicBlock::BB2) continue;
+        if (instr.basic_block == BasicBlock::BB1) continue; // already done in Phase 3
 
-        int cycle = scheduled_cycle[id];
-        if (cycle < 0) continue;
-
-        if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
-            schedule[cycle].BRANCH = instr.opcode + " " + std::to_string(loop_beginning);
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0 || instr.source_registers.empty()) {
+            if (new_source_regs[id].empty()) new_source_regs[id] = {};
             continue;
         }
+
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+
+        // rebuild source regs for this instruction
+        new_source_regs[id].clear();
+
+        for (const int src_reg : instr.source_registers) {
+            int resolved_reg = -1;
+
+            if (instr.basic_block == BasicBlock::BB0) {
+                // BB0 sources: check local deps within BB0
+                for (const int dep_id : entry.local_dependencies) {
+                    if (dep_id < 0 || dep_id >= instruction_count) continue;
+                    if (instructions[dep_id].destination_register != src_reg) continue;
+                    if (new_dest_reg[dep_id] != -1) {
+                        resolved_reg = new_dest_reg[dep_id];
+                        break;
+                    }
+                }
+            }
+
+            if (instr.basic_block == BasicBlock::BB2) {
+                // CASE C: post-loop dependency — value from last iteration of BB1
+                for (const int dep_id : entry.post_loop_dependencies) {
+                    if (dep_id < 0 || dep_id >= instruction_count) continue;
+                    if (instructions[dep_id].destination_register != src_reg) continue;
+                    if (instructions[dep_id].basic_block == BasicBlock::BB1 && new_dest_reg[dep_id] != -1) {
+                        int producer_stage = stage_by_id[dep_id];
+                        // iteration_offset = 0, stage_offset = (num_stages - 1) - St(producer)
+                        resolved_reg = new_dest_reg[dep_id] + (num_stages - 1) - producer_stage;
+                        break;
+                    }
+                }
+
+                // CASE D: loop invariant read from BB2
+                if (resolved_reg == -1) {
+                    for (const int dep_id : entry.loop_invariant_dependencies) {
+                        if (dep_id < 0 || dep_id >= instruction_count) continue;
+                        if (instructions[dep_id].destination_register != src_reg) continue;
+                        if (new_dest_reg[dep_id] != -1) {
+                            resolved_reg = new_dest_reg[dep_id];
+                            break;
+                        }
+                    }
+                }
+
+                // local dep within BB2
+                if (resolved_reg == -1) {
+                    for (const int dep_id : entry.local_dependencies) {
+                        if (dep_id < 0 || dep_id >= instruction_count) continue;
+                        if (instructions[dep_id].destination_register != src_reg) continue;
+                        if (new_dest_reg[dep_id] != -1) {
+                            resolved_reg = new_dest_reg[dep_id];
+                            break;
+                        }
+                    }
+                }
+            }
+
+            new_source_regs[id].push_back(resolved_reg);
+        }
+    }
+
+    // CASE E: orphan operands — same as alloc_b Phase 4
+    std::map<int, int> orphan_reg_map;
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        for (int s = 0; s < static_cast<int>(new_source_regs[id].size()); ++s) {
+            if (new_source_regs[id][s] == -1) {
+                int orig_reg = instr.source_registers[s];
+                if (orphan_reg_map.find(orig_reg) != orphan_reg_map.end()) {
+                    new_source_regs[id][s] = orphan_reg_map[orig_reg];
+                } else {
+                    orphan_reg_map[orig_reg] = next_static_reg;
+                    new_source_regs[id][s] = next_static_reg;
+                    next_static_reg++;
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // LOOP PREPARATION (Section 3.4)
+    // ========================================================================
+    // collapse multi-stage loop body into II bundles with predication
+    // and insert mov p32,true + mov EC,<num_stages-1> before the loop
+
+    // step 1: collect all BB1 instructions with their cycle and slot info
+    // we need to move them from their current multi-stage positions into
+    // a single II-bundle block starting at loop_beginning
+    // ========================================================================
+    // LOOP PREPARATION (Section 3.4)
+    // ========================================================================
+    // collapse multi-stage loop body into II bundles with predication
+    // and insert mov p32,true + mov EC,<num_stages-1> before the loop
+
+    // collect all BB1 instructions with their stage and position info
+    struct LoopInstr {
+        int id;
+        int stage;
+        int slot_in_ii; // which bundle within the II window: (cycle - loop_beginning) % ii
+        InstructionKind kind;
+        std::string text;
+    };
+    std::vector<LoopInstr> loop_instrs;
+
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        int cycle = scheduled_cycle[id];
+        if (cycle < loop_beginning) continue;
+
+        const Instruction& instr = instructions[id];
+        int stage = stage_by_id[id];
+        int slot_in_ii = (cycle - loop_beginning) % ii;
+
+        std::string text;
+        if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
+            // we'll set the real text at placement time when we know new_loop_beginning
+            text = "LOOP_PLACEHOLDER";
+        } else if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) {
+            text = instr.raw_text;
+        } else {
+            // build register-allocated text then add stage predicate
+            text = rebuild_instruction_text(instr, new_dest_reg[id], new_source_regs[id]);
+            int pred_reg = 32 + stage;
+            text = "(p" + std::to_string(pred_reg) + ") " + text;
+        }
+
+        loop_instrs.push_back({id, stage, slot_in_ii, instr.kind, text});
+    }
+
+    // figure out how far the current loop body extends so we can clear it
+    int max_loop_cycle = loop_beginning;
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block == BasicBlock::BB1 && scheduled_cycle[id] >= loop_beginning) {
+            max_loop_cycle = std::max(max_loop_cycle, scheduled_cycle[id]);
+        }
+    }
+
+    // clear the loop body area
+    for (int c = loop_beginning; c <= max_loop_cycle; ++c) {
+        if (c < static_cast<int>(schedule.size())) {
+            schedule[c] = Bundle();
+        }
+    }
+
+    // insert mov p32,true and mov EC,<num_stages-1> before the loop
+    // Per Section 3.4: "The two movs responsible for the initialization of EC and p32
+    // are inserted in the bundle right before the loop.pip instruction.
+    // If there are not enough ALU slots in that bundle, a new bundle is created."
+    //
+    // Strategy: place EC/p32 in the bundle at loop_beginning-1 if it's empty or has room.
+    // If the bundle at loop_beginning-1 has a free ALU slot, pack EC there and p32 in the
+    // other slot (or a new bundle). The loop body stays at loop_beginning.
+    // Only if loop_beginning-1 can't accommodate them, shift the loop body forward.
+    std::string ec_text = "mov EC, " + std::to_string(num_stages - 1);
+    std::string p32_text = "mov p32, true";
+
+    int new_loop_beginning;
+
+    if (loop_beginning > 0) {
+        Bundle& prev = schedule[loop_beginning - 1];
+        int free_alu = (prev.ALU0 == "nop" ? 1 : 0) + (prev.ALU1 == "nop" ? 1 : 0);
+
+        if (free_alu >= 2) {
+            // Two free ALU slots in the bundle before the loop — put both there
+            place_in_bundle(prev, InstructionKind::Mov, ec_text);
+            place_in_bundle(prev, InstructionKind::Mov, p32_text);
+            new_loop_beginning = loop_beginning;
+        } else if (free_alu == 1) {
+            // One free slot — pack EC there, p32 needs its own bundle
+            place_in_bundle(prev, InstructionKind::Mov, ec_text);
+            // shift loop body forward by 1 to make room for p32 bundle
+            new_loop_beginning = loop_beginning + 1;
+            ensure_bundle_capacity(schedule, new_loop_beginning + ii - 1);
+            for (int c = loop_beginning; c < new_loop_beginning + ii; ++c) {
+                if (c < static_cast<int>(schedule.size())) schedule[c] = Bundle();
+            }
+            schedule[loop_beginning].ALU0 = p32_text;
+        } else {
+            // No free ALU slots — need a new bundle for both, shift loop forward
+            new_loop_beginning = loop_beginning + 1;
+            ensure_bundle_capacity(schedule, new_loop_beginning + ii - 1);
+            for (int c = loop_beginning; c < new_loop_beginning + ii; ++c) {
+                if (c < static_cast<int>(schedule.size())) schedule[c] = Bundle();
+            }
+            schedule[loop_beginning].ALU0 = ec_text;
+            schedule[loop_beginning].ALU1 = p32_text;
+        }
+    } else {
+        // no BB0 at all — create a bundle for EC/p32 at cycle 0
+        new_loop_beginning = 1;
+        ensure_bundle_capacity(schedule, new_loop_beginning + ii - 1);
+        for (int c = 0; c < new_loop_beginning + ii; ++c) {
+            if (c < static_cast<int>(schedule.size())) schedule[c] = Bundle();
+        }
+        schedule[0].ALU0 = ec_text;
+        schedule[0].ALU1 = p32_text;
+    }
+
+    // clear the loop body area (new_loop_beginning .. new_loop_beginning + ii - 1)
+    for (int c = new_loop_beginning; c < new_loop_beginning + ii; ++c) {
+        ensure_bundle_capacity(schedule, c);
+        schedule[c] = Bundle();
+    }
+
+    // place collapsed loop instructions into the II bundles
+    for (const auto& li : loop_instrs) {
+        int target_cycle = new_loop_beginning + li.slot_in_ii;
+        ensure_bundle_capacity(schedule, target_cycle);
+        Bundle& b = schedule[target_cycle];
+
+        if (li.kind == InstructionKind::Loop || li.kind == InstructionKind::LoopPip) {
+            // now we know new_loop_beginning, so we can write the correct text
+            b.BRANCH = "loop.pip " + std::to_string(new_loop_beginning);
+        } else if (is_alu_kind(li.kind)) {
+            if (b.ALU0 == "nop") b.ALU0 = li.text;
+            else b.ALU1 = li.text;
+        } else if (li.kind == InstructionKind::Mulu) {
+            b.MUL = li.text;
+        } else if (li.kind == InstructionKind::Ld || li.kind == InstructionKind::St) {
+            b.MEM = li.text;
+        }
+
+        scheduled_cycle[li.id] = target_cycle;
+    }
+
+    // rewrite BB0 instruction texts with new registers
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        if (instr.basic_block != BasicBlock::BB0) continue;
+        int cycle = scheduled_cycle[id];
+        if (cycle < 0) continue;
 
         if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
 
@@ -683,40 +1027,23 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
         }
     }
 
-    // ========================================================================
-    // LOOP PREPARATION (Section 3.4): collapse stages + add predication
-    // ========================================================================
-    // TODO: After register allocation, the schedule has multiple stages
-    // (each II bundles long). We need to collapse them into a single block
-    // of II bundles where instructions from different stages coexist.
-    //
-    // Each instruction gets a predicate based on its stage:
-    //   stage 0 -> (p32), stage 1 -> (p33), stage 2 -> (p34), etc.
-    //
-    // The loop.pip instruction itself is NOT predicated.
-    //
-    // Before the loop body, insert two mov instructions:
-    //   "mov p32, true"  — enables the first stage predicate
-    //   "mov EC, <num_stages - 1>"  — sets the epilogue count
-    // These go in the bundle right before the loop body starts.
-    // If there's no room in that bundle, create a new one.
-    //
-    // The collapse works by taking each instruction at cycle C in stage S
-    // and moving it to cycle (loop_beginning + (C - loop_beginning) % ii).
-    // The instruction text gets prefixed with its predicate: "(p32) add ..."
-    //
-    // After collapsing, the schedule should have:
-    //   BB0 bundles (unchanged)
-    //   mov p32, true + mov EC, <num_stages-1> bundle
-    //   II bundles of the collapsed loop body (with loop.pip in last bundle)
-    //   BB2 bundles (added later by schedule_bb2)
+    // trim schedule to BB0 + ec/p32 bundle + II loop bundles
+    // BB2 will be added later by schedule_bb2
+    schedule.resize(new_loop_beginning + ii);
 
-    // TODO: implement loop preparation
+    // update loop_beginning for the return value
+    loop_beginning = new_loop_beginning;
 
+    // update the loop instruction's scheduled_cycle to its final position
+    for (int i = 0; i < instruction_count; ++i) {
+        if (instructions[i].kind == InstructionKind::Loop || instructions[i].kind == InstructionKind::LoopPip) {
+            scheduled_cycle[i] = new_loop_beginning + ii - 1;
+        }
+    }
 
     AllocResult result;
     result.new_dest_reg = new_dest_reg;
     result.new_source_regs = new_source_regs;
-    result.loop_beginning = loop_beginning;
+    result.loop_beginning = new_loop_beginning;
     return result;
 }

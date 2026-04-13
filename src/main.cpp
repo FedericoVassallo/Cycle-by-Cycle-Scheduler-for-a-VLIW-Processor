@@ -45,9 +45,40 @@ int main(int argc, char* argv[]) {
         rewrite_bb2_bundles(schedule_basic, instructions, sched_cycle_basic, alloc_result);
         IOHandler::write_packets(loop_output, bundles_to_packets(schedule_basic));
 
-        // loop.pip: placeholder for now, writes empty output
-        std::vector<std::vector<std::string>> empty_looppip;
-        IOHandler::write_packets(looppip_output, empty_looppip);
+        // check if the program has a loop instruction
+        bool has_loop = false;
+        for (const auto& instr : instructions) {
+            if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
+                has_loop = true;
+                break;
+            }
+        }
+
+        // loop.pip schedule
+        if (has_loop) {
+            std::vector<Bundle> schedule_adv;
+            std::vector<int> sched_cycle_adv(instructions.size(), -1);
+            int ii_adv, loop_begin_adv, num_stages_adv;
+            std::vector<int> stage_by_id_adv;
+            schedule_ASAP_advanced(analysis_table, schedule_adv, instructions, sched_cycle_adv,
+                                   ii_adv, loop_begin_adv, num_stages_adv, stage_by_id_adv);
+            AllocResult alloc_r_result = alloc_r(schedule_adv, analysis_table, instructions,
+                                                  sched_cycle_adv, ii_adv, loop_begin_adv,
+                                                  num_stages_adv, stage_by_id_adv);
+            schedule_bb2(analysis_table, schedule_adv, instructions, sched_cycle_adv);
+            rewrite_bb2_bundles(schedule_adv, instructions, sched_cycle_adv, alloc_r_result);
+            IOHandler::write_packets(looppip_output, bundles_to_packets(schedule_adv));
+        } else {
+            // no loop — just reuse the basic schedule for looppip output too
+            // re-run the basic pipeline since schedule_basic was already modified by alloc_b
+            std::vector<Bundle> schedule_noloop;
+            std::vector<int> sched_cycle_noloop(instructions.size(), -1);
+            schedule_ASAP_basic(analysis_table, schedule_noloop, instructions, sched_cycle_noloop);
+            AllocResult alloc_noloop = alloc_b(schedule_noloop, analysis_table, instructions, sched_cycle_noloop);
+            schedule_bb2(analysis_table, schedule_noloop, instructions, sched_cycle_noloop);
+            rewrite_bb2_bundles(schedule_noloop, instructions, sched_cycle_noloop, alloc_noloop);
+            IOHandler::write_packets(looppip_output, bundles_to_packets(schedule_noloop));
+        }
 
         return 0;
     } catch (const std::exception& e) {
