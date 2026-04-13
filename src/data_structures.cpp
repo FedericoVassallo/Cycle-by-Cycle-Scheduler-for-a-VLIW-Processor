@@ -233,7 +233,7 @@ int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
                              std::vector<Bundle>& schedule,
                              std::vector<int>& scheduled_cycle,
                              const std::vector<InstructionKind>& kind_by_id,
-                             const std::vector<int>& extra_dependencies = {}) {
+                             const std::vector<int>& extra_dependencies) {
     int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
     earliest = std::max(earliest, max_ready_cycle(extra_dependencies, scheduled_cycle, kind_by_id));
 
