@@ -148,18 +148,30 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
             // scan all dependencies to find who produces this source register
             for (const int dep_id : all_deps) {
                 if (dep_id < 0 || dep_id >= instruction_count) continue;
-
-                // does this dependency actually write to the register we're looking for?
                 if (instructions[dep_id].destination_register != src_reg) continue;
 
-                if (best_producer == -1) {
-                    // first match — take it
-                    best_producer = dep_id;
-                    found_preferred = (instructions[dep_id].basic_block == preferred_bb);
-                } else if (instructions[dep_id].basic_block == preferred_bb && !found_preferred) {
-                    // found a producer in the preferred BB — switch to it
-                    best_producer = dep_id;
-                    found_preferred = true;
+                if (instr.basic_block == BasicBlock::BB2) {
+                    // BB2 prefers BB1 producers
+                    if (instructions[dep_id].basic_block == BasicBlock::BB1) {
+                        if (best_producer == -1 || !found_preferred) {
+                            best_producer = dep_id;
+                            found_preferred = true;
+                        }
+                    } else if (!found_preferred) {
+                        best_producer = dep_id;
+                    }
+                } else {
+                    // BB1 and BB0 prefer BB0 producers, and among BB0 pick the latest scheduled
+                    if (instructions[dep_id].basic_block == BasicBlock::BB0) {
+                        if (!found_preferred || scheduled_cycle[dep_id] > scheduled_cycle[best_producer]) {
+                            best_producer = dep_id;
+                            found_preferred = true;
+                        }
+                    } else if (!found_preferred) {
+                        if (best_producer == -1) {
+                            best_producer = dep_id;
+                        }
+                    }
                 }
             }
 
@@ -226,13 +238,16 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
             int bb0_producer = -1;
             int bb1_producer = -1;
 
-            // search all dependency lists to find if both BB0 and BB1 produce this register
             auto search_deps = [&](const std::vector<int>& deps) {
                 for (const int dep_id : deps) {
                     if (dep_id < 0 || dep_id >= instruction_count) continue;
                     if (instructions[dep_id].destination_register != src_reg) continue;
                     if (instructions[dep_id].basic_block == BasicBlock::BB0) {
-                        bb0_producer = dep_id;
+                        // if multiple BB0 instructions write the same register,
+                        // pick the one scheduled latest — that's the value BB1 actually sees
+                        if (bb0_producer == -1 || scheduled_cycle[dep_id] > scheduled_cycle[bb0_producer]) {
+                            bb0_producer = dep_id;
+                        }
                     } else if (instructions[dep_id].basic_block == BasicBlock::BB1) {
                         bb1_producer = dep_id;
                     }
