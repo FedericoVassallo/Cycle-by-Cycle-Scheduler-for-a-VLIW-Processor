@@ -21,5 +21,14 @@ void rewrite_bb2_bundles(std::vector<Bundle>& schedule,
                          const std::vector<Instruction>& instructions,
                          const std::vector<int>& scheduled_cycle,
                          const AllocResult& alloc);
+                         
+AllocResult alloc_r(std::vector<Bundle>& schedule,
+                    const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                    const std::vector<Instruction>& instructions,
+                    std::vector<int>& scheduled_cycle,
+                    int ii,
+                    int loop_beginning,
+                    int num_stages,
+                    const std::vector<int>& stage_by_id);
 
 #endif // REGISTER_ALLOCATION_HPP
