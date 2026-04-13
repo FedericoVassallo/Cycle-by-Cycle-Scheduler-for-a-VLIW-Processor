@@ -6,7 +6,10 @@
 #include <exception>
 #include <iostream>
 
-// converts our Bundle structs into the 5-slot string arrays that write_packets expects
+// it is a function that converts our Bundle structs into the 5-slot string arrays that write_packets expects
+// it takes schedule as input, which is a vector of Bundles, and for each bundle it creates a vector of strings with the instructions in the order ALU0, ALU1, MUL, MEM, BRANCH
+// it gives as output a vector of vector of strings, where each inner vector is a packet (so the instructions scheduled in the same cycle) and the outer vector is the whole schedule
+// is used to convert the schedule into the right format for output and testing
 std::vector<std::vector<std::string>> bundles_to_packets(const std::vector<Bundle>& schedule) {
     std::vector<std::vector<std::string>> packets;
     for (const auto& b : schedule) {
@@ -21,15 +24,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const std::string input_path = argv[1];
-    const std::string loop_output = argv[2];
-    const std::string looppip_output = argv[3];
+    const std::string input_path = argv[1]; // input JSON file with instruction strings
+    const std::string loop_output = argv[2]; // output JSON file for the basic schedule
+    const std::string looppip_output = argv[3]; // output JSON file for the loop.pip schedule 
 
     try {
         // This loads JSON instruction strings and parses them into typed records.
         std::vector<Instruction> instructions = IOHandler::read_and_parse_instructions(input_path);
 
-        // This updates the basic block information for each instruction based on loop boundaries.
+        // This assigns the basic block information for each instruction based on loop boundaries.
         update_instructions_bb(instructions);
 
         // This performs dependency analysis and fills the analysis table with dependency information.
@@ -43,7 +46,7 @@ int main(int argc, char* argv[]) {
         AllocResult alloc_result = alloc_b(schedule_basic, analysis_table, instructions, sched_cycle_basic);
         schedule_bb2(analysis_table, schedule_basic, instructions, sched_cycle_basic);
         rewrite_bb2_bundles(schedule_basic, instructions, sched_cycle_basic, alloc_result);
-        IOHandler::write_packets(loop_output, bundles_to_packets(schedule_basic));
+        IOHandler::write_packets(loop_output, bundles_to_packets(schedule_basic)); // here we output the basic schedule 
 
         // check if the program has a loop instruction
         bool has_loop = false;
@@ -69,8 +72,7 @@ int main(int argc, char* argv[]) {
             rewrite_bb2_bundles(schedule_adv, instructions, sched_cycle_adv, alloc_r_result);
             IOHandler::write_packets(looppip_output, bundles_to_packets(schedule_adv));
         } else {
-            // no loop — just reuse the basic schedule for looppip output too
-            // re-run the basic pipeline since schedule_basic was already modified by alloc_b
+            // if there is no loop, just reuse the basic schedule for looppip output too
             std::vector<Bundle> schedule_noloop;
             std::vector<int> sched_cycle_noloop(instructions.size(), -1);
             schedule_ASAP_basic(analysis_table, schedule_noloop, instructions, sched_cycle_noloop);

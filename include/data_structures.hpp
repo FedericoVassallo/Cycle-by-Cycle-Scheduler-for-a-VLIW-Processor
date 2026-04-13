@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+// enum for the type of the instruction
 enum class InstructionKind {
     Unknown,
     Nop,
@@ -18,12 +19,14 @@ enum class InstructionKind {
     LoopPip
 };
 
+// to distinguish between the three basic blocks (BB0, BB1, BB2)
 enum class BasicBlock {
     BB0,
     BB1,
     BB2,
 };
 
+// struct of a bundle, which can contain up to 5 instructions 
 struct Bundle {
     std::string ALU0 = "nop";
     std::string ALU1 = "nop";
@@ -32,11 +35,12 @@ struct Bundle {
     std::string BRANCH = "nop";
 };
 
+// struct for the manipulation of the instruction
 struct Instruction {
-    std::string raw_text;
+    std::string raw_text; // the text directly taken from the input.json
     std::string predicate_register;
     std::string opcode;
-    InstructionKind kind = InstructionKind::Unknown;
+    InstructionKind kind = InstructionKind::Unknown; // initialized to unkown
 
     int destination_register = -1;
     std::vector<int> source_registers;
@@ -51,18 +55,24 @@ struct Instruction {
     bool has_loop_target = false;
     int loop_target = -1;
 
-    BasicBlock basic_block = BasicBlock::BB0;
+    BasicBlock basic_block = BasicBlock::BB0; // basic block where it belongs 
 };
 
+// it rappresent the DependencyAnalysis for a given instruction
 struct DependencyAnalysisTableEntry {
     int address = -1;
     int id = -1;
     InstructionKind instruction_type = InstructionKind::Unknown;
     int destination_register = -1;
-    std::vector<int> local_dependencies;
-    std::vector<int> interloop_dependencies;
-    std::vector<int> loop_invariant_dependencies;
-    std::vector<int> post_loop_dependencies;
+    std::vector<int> local_dependencies; // When the producer and consumer are in the same basic block 
+
+    std::vector<int> interloop_dependencies;  // both the producer and the consumer are inside the loop(BB1). But the consumer is not reading the value computed now, but the one calculated in the previous iteration
+    // it is generated in one loop iteration and is needed for the next 
+
+    std::vector<int> loop_invariant_dependencies; // If the producer is in BB0, and consumers are in BB1, and optionally in BB0 and BB2
+    // for loop invariant the produces is in BB0 (outside the loop) and the consumer is in BB1 (inside the loop), but no instruction inside BB1 ever overwrites that register, so we can consider it as a constant value for the entire loop body
+
+    std::vector<int> post_loop_dependencies; // // If the producer is in BB1 and the consumer in BB2, the data gets calculated during the loop but is used only at the end of the loop
 };
 
 // it rappresent the [j] entry of the S[s][i][j] of section 3.2.2 
@@ -75,17 +85,18 @@ struct HardwareResources {
     bool branch_used = false; // Indicates if the BRANCH unit is used in the current bundle
 };
 
+// is a struct that has a vector of HardwareResources (so basically it is a vector of bundles) in which it sets if for a given cycle a certain resource is occupied 
 struct SlotTable {
     std::vector<HardwareResources> table;
     int currentII = 0; 
 
-    // DECLARATIONS ONLY (Notice the semicolons at the end!)
+    // helper function to check the status of the slot table 
     void init_reset(int ii);
-    bool can_schedule(int actual_cycle, InstructionKind instr_kind) const;
+    bool can_schedule(int actual_cycle, InstructionKind instr_kind) const;  // const at the end to be sure it does not modify any data in SlotTable obj
     void reserve_resources(int actual_cycle, InstructionKind instr_kind);
 };
 
-// shared helpers used by both the scheduler and register allocation
+// helpers used by both the scheduler and register allocation
 int instruction_latency(InstructionKind kind);
 bool is_alu_kind(InstructionKind kind);
 bool ensure_bundle_capacity(std::vector<Bundle>& schedule, int cycle);

@@ -8,10 +8,14 @@ void SlotTable::init_reset(int ii) {
     table.resize(ii); // Initialize the table with 'ii' entries, each representing a slot for one iteration
 }
 
-// we check if we can schedule an instruction in the current slot (which is determined by the current iteration and the current II) by checking the hardware resources used in that slot
-// we get as input the kind of the instruction we want to schedule and we check if the corresponding hardware resource is available in the current slot
-// to get the current slot we get it from the actual cycle we are trying to schedule the instruction by doing the modulo of the current cycle with the current II (currentII)
+// we check if we can schedule an instruction in the current slot (which is determined by the current iteration and the current II) 
+// by checking the hardware resources used in that slot
+// we get as input the kind of the instruction we want to schedule and we check if the 
+// corresponding hardware resource is available in the current slot
+// to get the current slot we get it from the actual cycle we are trying to schedule the instruction 
+// by doing the modulo of the current cycle with the current II (currentII)
 // the modulo we do it using the remainder op %
+
 bool SlotTable::can_schedule(int actual_cycle, InstructionKind instr_kind) const {
     int target_row = actual_cycle % currentII; // Get the target row based on the actual cycle and the current II
     const HardwareResources& resources = table[target_row]; // Get the hardware resources for the target row
@@ -37,6 +41,7 @@ bool SlotTable::can_schedule(int actual_cycle, InstructionKind instr_kind) const
     }
 }
 
+// this function actually reserves the hardware resources in the slot table for a given instruction kind, so that subsequent calls to can_schedule will return false for that resource until we reset the table for a new II
 void SlotTable::reserve_resources(int actual_cycle, InstructionKind instr_kind) {
     int target_row = actual_cycle % currentII; // Get the target row based on the actual cycle and the current II
     HardwareResources& resources = table[target_row]; // Get the hardware resources for the target row
@@ -91,12 +96,12 @@ bool ensure_bundle_capacity(std::vector<Bundle>& schedule, int cycle) {
         return false;
     }
     if (static_cast<int>(schedule.size()) <= cycle) {
-        schedule.resize(static_cast<size_t>(cycle + 1));
+        schedule.resize(static_cast<size_t>(cycle + 1)); // if needed we resize the schedule adding 1 cycle
     }
     return true;
 }
 
-// Checks if an instructions can be placed in a bundle 
+// Checks if an instructions can be placed in a bundle (so if there is space available)
 bool can_place_in_bundle(const Bundle& bundle, InstructionKind kind) {
     if (is_alu_kind(kind)) {
         return bundle.ALU0 == "nop" || bundle.ALU1 == "nop";
@@ -160,11 +165,14 @@ bool place_in_bundle(Bundle& bundle, InstructionKind kind, const std::string& ra
 
 // returns the earliest ready cycle where we can schedule the instruction given the dependencies (the cycle when the producer was 
 // scheduled and the latency of the producer) 
+// scheduled_cycle is a vector that for each instruction id gives the cycle where it is scheduled (or -1 if it is not scheduled yet)
+// deps is a vector of instruction ids that are dependencies for the instruction we want to schedule (so the producers)
+// kind by_id is a vector that for each instruction id gives the kind of the instruction (so we can get the latency of the producer)
 int max_ready_cycle(const std::vector<int>& deps,
                     const std::vector<int>& scheduled_cycle,
                     const std::vector<InstructionKind>& kind_by_id) {
     int earliest = 0;
-    for (const int dep_id : deps) {
+    for (const int dep_id : deps) { // we check all the dependencies of the instruction we want to schedule (so all its producers)
         // these first two check are just sanity checks (to make sure data is valid)
         if (dep_id < 0 || dep_id >= static_cast<int>(scheduled_cycle.size())) {
             continue;
@@ -172,7 +180,7 @@ int max_ready_cycle(const std::vector<int>& deps,
         if (scheduled_cycle[dep_id] < 0) {
             continue;
         }
-        earliest = std::max(earliest, scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id]));
+        earliest = std::max(earliest, scheduled_cycle[dep_id] + instruction_latency(kind_by_id[dep_id])); 
     }
     return earliest;
 }
@@ -228,6 +236,8 @@ bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
 }
 
 // Schedules an entry (no modulo scheduling, used for BB0 and BB2 instructions)
+// extra_dependencies is used for BB2 instructions to also consider dependencies to BB1 producers when scheduling BB2 instructions
+// 
 int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
                              const std::vector<Instruction>& instructions,
                              std::vector<Bundle>& schedule,
@@ -322,7 +332,7 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
 std::string rebuild_instruction_text(const Instruction& instr, int new_dest, const std::vector<int>& new_sources) {
     std::string text;
 
-    // add predicate prefix if present, e.g. "(p32) "
+    // add predicate prefix if present, ex: "(p32) "
     if (!instr.predicate_register.empty()) {
         text += "(" + instr.predicate_register + ") ";
     }

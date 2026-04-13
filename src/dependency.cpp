@@ -5,10 +5,10 @@
 #include <stdexcept>
 
 void update_instructions_bb(std::vector<Instruction>& instructions) {
-    BasicBlock current_bb = BasicBlock::BB0;
+    BasicBlock current_bb = BasicBlock::BB0; // We start assuming that we are in BB0, since the first instructions before the loop belong to BB0
     for (int i = 0; i < static_cast<int>(instructions.size()); ++i) {
         Instruction& instr = instructions[i];
-        instr.basic_block = current_bb;
+        instr.basic_block = current_bb; 
 
         if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
             current_bb = BasicBlock::BB1; 
@@ -52,7 +52,6 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
             entry.destination_register = instr.destination_register;
         }
 
-        
         // Dependencies: Check previous instructions for register usage.
         for (int j = i - 1; j >= 0; --j) {
             const Instruction& prev_instr = instructions[j];
