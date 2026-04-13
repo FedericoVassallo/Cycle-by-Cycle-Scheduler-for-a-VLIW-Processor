@@ -28,7 +28,6 @@ int main(int argc, char* argv[]) {
     try {
         // This loads JSON instruction strings and parses them into typed records.
         std::vector<Instruction> instructions = IOHandler::read_and_parse_instructions(input_path);
-        std::cout << "Loaded " << instructions.size() << " instructions from " << input_path << std::endl;
 
         // This updates the basic block information for each instruction based on loop boundaries.
         update_instructions_bb(instructions);
@@ -49,7 +48,7 @@ int main(int argc, char* argv[]) {
         // loop.pip: placeholder for now, writes empty output
         std::vector<std::vector<std::string>> empty_looppip;
         IOHandler::write_packets(looppip_output, empty_looppip);
-		
+
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

@@ -98,6 +98,10 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         }
     }
 
+    if (loop_id < 0) {
+    return;
+    }
+
     // Schedule BB1 instructions (except loop) ASAP from loop_beginning.
     // Without loop.pip, the loop body has a single stage and the II equals the loop body length,
     // so we don't need modulo scheduling or the SlotTable here.
@@ -302,6 +306,10 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
         } else {
             bb1_non_loop_ids.push_back(id);
         }
+    }
+
+    if (loop_id < 0) {
+    return;
     }
 
     // BB1 modulo scheduling with increasing II
