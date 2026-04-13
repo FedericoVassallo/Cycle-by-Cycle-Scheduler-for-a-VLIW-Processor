@@ -345,35 +345,6 @@ std::string rebuild_instruction_text(const Instruction& instr, int new_dest, con
         return instr.raw_text;
     }
 
-    // extracts the last comma-separated token from the original text
-    // used to preserve hex formatting of immediates like 0x1000
-    auto extract_original_immediate = [](const std::string& raw) -> std::string {
-        auto pos = raw.rfind(',');
-        if (pos == std::string::npos) return "";
-        std::string token = raw.substr(pos + 1);
-        size_t start = token.find_first_not_of(" \t");
-        size_t end = token.find_last_not_of(" \t");
-        if (start == std::string::npos) return "";
-        return token.substr(start, end - start + 1);
-    };
-
-    // extracts the offset part from a memory operand like "0x1000(x2)"
-    // we need this to preserve hex formatting of offsets
-    auto extract_original_offset = [](const std::string& raw) -> std::string {
-        auto paren = raw.rfind('(');
-        if (paren == std::string::npos || paren == 0) return "0";
-        size_t end = paren;
-        size_t start = end - 1;
-        while (start > 0 && raw[start] == ' ') start--;
-        size_t comma = raw.rfind(',', start);
-        size_t space = raw.rfind(' ', start);
-        size_t tok_start = 0;
-        if (comma != std::string::npos) tok_start = comma + 1;
-        if (space != std::string::npos && space > tok_start) tok_start = space + 1;
-        while (tok_start < end && raw[tok_start] == ' ') tok_start++;
-        return raw.substr(tok_start, end - tok_start);
-    };
-
     // destination register
     if (new_dest != -1) {
         text += " x" + std::to_string(new_dest);
@@ -384,7 +355,7 @@ std::string rebuild_instruction_text(const Instruction& instr, int new_dest, con
     // mov dest, source_or_immediate
     if (instr.kind == InstructionKind::Mov) {
         if (instr.has_immediate) {
-            text += ", " + extract_original_immediate(instr.raw_text);
+            text += ", " + std::to_string(instr.immediate_value);
         } else if (src_idx < static_cast<int>(new_sources.size())) {
             text += ", x" + std::to_string(new_sources[src_idx]);
             src_idx++;
@@ -404,7 +375,7 @@ std::string rebuild_instruction_text(const Instruction& instr, int new_dest, con
             src_idx++;
         }
         if (instr.has_memory_operand && src_idx < static_cast<int>(new_sources.size())) {
-            text += ", " + extract_original_offset(instr.raw_text) + "(x" + std::to_string(new_sources[src_idx]) + ")";
+            text += ", " + std::to_string(instr.memory_offset) + "(x" + std::to_string(new_sources[src_idx]) + ")";
             src_idx++;
         }
         return text;
@@ -413,7 +384,7 @@ std::string rebuild_instruction_text(const Instruction& instr, int new_dest, con
     // ld dest, offset(base)
     if (instr.kind == InstructionKind::Ld) {
         if (instr.has_memory_operand && src_idx < static_cast<int>(new_sources.size())) {
-            text += ", " + extract_original_offset(instr.raw_text) + "(x" + std::to_string(new_sources[src_idx]) + ")";
+            text += ", " + std::to_string(instr.memory_offset) + "(x" + std::to_string(new_sources[src_idx]) + ")";
             src_idx++;
         }
         return text;
@@ -425,7 +396,7 @@ std::string rebuild_instruction_text(const Instruction& instr, int new_dest, con
         src_idx++;
     }
     if (instr.has_immediate) {
-        text += ", " + extract_original_immediate(instr.raw_text);
+        text += ", " + std::to_string(instr.immediate_value);
     } else if (src_idx < static_cast<int>(new_sources.size())) {
         text += ", x" + std::to_string(new_sources[src_idx]);
         src_idx++;
