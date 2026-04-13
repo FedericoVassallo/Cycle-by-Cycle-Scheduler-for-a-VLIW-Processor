@@ -188,9 +188,17 @@ void schedule_bb2(const std::vector<DependencyAnalysisTableEntry>& analysis_tabl
 
     // find the loop instruction's final cycle so we know where BB2 starts
     int loop_cycle = -1;
+    bool is_loop_pip = false;
     for (int i = 0; i < instruction_count; ++i) {
         if (instructions[i].kind == InstructionKind::Loop || instructions[i].kind == InstructionKind::LoopPip) {
             loop_cycle = scheduled_cycle[i];
+        }
+    }
+    // detect loop.pip from the schedule itself (alloc_r rewrites "loop" to "loop.pip")
+    for (int c = 0; c < static_cast<int>(schedule.size()); ++c) {
+        if (schedule[c].BRANCH.rfind("loop.pip", 0) == 0) {
+            is_loop_pip = true;
+            break;
         }
     }
 
@@ -206,14 +214,22 @@ void schedule_bb2(const std::vector<DependencyAnalysisTableEntry>& analysis_tabl
 
         const DependencyAnalysisTableEntry& entry = analysis_table[ai];
 
-        // BB2 depends on post-loop producers (BB1 instructions from the last iteration)
-        // and possibly loop-invariant producers (BB0 instructions)
-        std::vector<int> deps = entry.post_loop_dependencies;
-        deps.insert(deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
-
-        // compute the earliest cycle from dependencies
+        // compute the earliest cycle from local dependencies
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
-        earliest = std::max(earliest, max_ready_cycle(deps, scheduled_cycle, kind_by_id));
+
+        // For loop.pip: by the time BB2 runs the epilogue has fully drained,
+        // so all post-loop values are already available. We only need bb2_start.
+        // For basic loop: post-loop deps need latency checks since the value
+        // is produced within the loop body on the last iteration.
+        if (!is_loop_pip) {
+            std::vector<int> deps = entry.post_loop_dependencies;
+            deps.insert(deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
+            earliest = std::max(earliest, max_ready_cycle(deps, scheduled_cycle, kind_by_id));
+        } else {
+            // still check loop-invariant deps (BB0 producers) since they have real cycle positions
+            earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
+        }
+
         // but never before bb2_start
         earliest = std::max(earliest, bb2_start);
 
@@ -233,7 +249,11 @@ void schedule_bb2(const std::vector<DependencyAnalysisTableEntry>& analysis_tabl
 void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                             std::vector<Bundle>& schedule,
                             const std::vector<Instruction>& instructions,
-                            std::vector<int>& scheduled_cycle) {
+                            std::vector<int>& scheduled_cycle,
+                            int& out_ii,
+                            int& out_loop_beginning,
+                            int& out_num_stages,
+                            std::vector<int>& out_stage_by_id) {
 
     schedule.clear();
     const int instruction_count = static_cast<int>(instructions.size());
@@ -443,8 +463,11 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     // The total number of stages is the index of the last stage + 1
     int num_stages = max_stage + 1;
 
-    // BB2 is NOT scheduled here for the same reason as schedule_ASAP_basic:
-    // alloc_r may modify the loop position, so schedule_bb2 handles it after allocation
+    // pass computed values back to the caller for register allocation
+    out_ii = ii;
+    out_loop_beginning = loop_beginning;
+    out_num_stages = num_stages;
+    out_stage_by_id = stage_by_id;
 }
 
 int calculate_II_res(const std::vector<Instruction>& instructions) {
