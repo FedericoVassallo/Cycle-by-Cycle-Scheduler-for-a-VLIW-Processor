@@ -1,4 +1,5 @@
 #include "data_structures.hpp"
+#include <stdexcept>
 
 // since the scheduling might fail for a given II, we need to be able to set a new II and reset the table for the new scheduling attempt
 void SlotTable::init_reset(int ii) {

@@ -95,4 +95,39 @@ bool place_in_bundle(Bundle& bundle, InstructionKind kind, const std::string& ra
 // reconstructs instruction text from parsed fields and new register assignments
 std::string rebuild_instruction_text(const Instruction& instr, int new_dest, const std::vector<int>& new_sources);
 
+// returns the earliest ready cycle where we can schedule the instruction given the dependencies
+int max_ready_cycle(const std::vector<int>& deps,
+                    const std::vector<int>& scheduled_cycle,
+                    const std::vector<InstructionKind>& kind_by_id);
+
+// checks loop-carried recurrence constraints after a full BB1 placement attempt
+bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
+                                     const std::vector<bool>& is_bb1,
+                                     const std::vector<int>& analysis_index_by_id,
+                                     const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                                     const std::vector<int>& scheduled_cycle,
+                                     const std::vector<InstructionKind>& kind_by_id,
+                                     int ii);
+
+// schedules an entry (no modulo scheduling, used for BB0 and BB2 instructions)
+int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
+                             const std::vector<Instruction>& instructions,
+                             std::vector<Bundle>& schedule,
+                             std::vector<int>& scheduled_cycle,
+                             const std::vector<InstructionKind>& kind_by_id,
+                             const std::vector<int>& extra_dependencies = {});
+
+// attempts to schedule BB1 instructions with a given initiation interval (II)
+bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
+                              const std::vector<bool>& is_bb1,
+                              const std::vector<int>& analysis_index_by_id,
+                              const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                              std::vector<Bundle>& schedule,
+                              std::vector<int>& scheduled_cycle,
+                              const std::vector<InstructionKind>& kind_by_id,
+                              const std::vector<Instruction>& instructions,
+                              SlotTable& slot_table,
+                              int& ii,
+                              int loop_beginning);
+
 #endif // DATA_STRUCTURES_HPP
