@@ -190,7 +190,6 @@ int max_ready_cycle(const std::vector<int>& deps,
 // consumer_cycle >= producer_cycle + latency(producer) - II
 bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
                                      const std::vector<bool>& is_bb1,
-                                     const std::vector<int>& analysis_index_by_id,
                                      const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                                      const std::vector<int>& scheduled_cycle,
                                      const std::vector<InstructionKind>& kind_by_id,
@@ -198,16 +197,11 @@ bool interloop_constraints_satisfied(const std::vector<int>& bb1_ids,
 
     for (const int id : bb1_ids) { // look at all the instr in BB1 (since only they can have interloop dependencies with other BB1 instructions)
         // Sanity checks to ensure we have valid data before checking constraints
-        if (id < 0 || id >= static_cast<int>(analysis_index_by_id.size())) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) {
             continue;
         }
 
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) {
-            continue;
-        }
-
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
         if (id < 0 || id >= static_cast<int>(scheduled_cycle.size()) || scheduled_cycle[id] < 0) {
             continue;
         }
@@ -264,7 +258,6 @@ int schedule_entry_no_modulo(const DependencyAnalysisTableEntry& entry,
 
 bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
                               const std::vector<bool>& is_bb1,
-                              const std::vector<int>& analysis_index_by_id,
                               const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                               std::vector<Bundle>& schedule,
                               std::vector<int>& scheduled_cycle,
@@ -274,14 +267,13 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
                               int& ii,
                               int loop_beginning) {
     for (const int id : bb1_ids) {
-        // With the id we find the corresponding entry index in the analysis table 
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) {
+        // With the id we find the corresponding entry in the analysis table 
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) {
             continue;
         }
 
         // We extract the entry from the analysis table and we schedule it with modulo scheduling 
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
@@ -320,7 +312,7 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
     }
 
     // Validate loop-carried dependencies once all BB1 instructions have tentative cycles.
-    if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table, scheduled_cycle, kind_by_id, ii)) {
+    if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_table, scheduled_cycle, kind_by_id, ii)) {
         ii++;
         return false;
     }

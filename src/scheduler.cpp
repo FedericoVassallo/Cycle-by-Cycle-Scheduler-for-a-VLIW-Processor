@@ -19,7 +19,6 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
 
     // Preallocate vectors for which we know the size (instruction_count) and initialize them to undefined values (-1 and Unknown)
     // To easily extract information on an instruction based on the id 
-    std::vector<int> analysis_index_by_id(static_cast<size_t>(instruction_count), -1);
     std::vector<InstructionKind> kind_by_id(static_cast<size_t>(instruction_count), InstructionKind::Unknown);
 
     // Defining the vectors where we'll store the different ids of the belonging instructions 
@@ -39,8 +38,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
             continue;
         }
         
-        // We map the analysis index and the kind to the entry id 
-        analysis_index_by_id[entry.id] = analysis_index;
+        // We map the kind to the entry id 
         kind_by_id[entry.id] = entry.instruction_type;
 
         // We divide all the entries in the basick blocks they belong to differentiate the scheduling strategy 
@@ -56,13 +54,12 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
 
     // BB0 contains setup code, scheduled once before the loop body.
     for (const int id : bb0_ids) {
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) {
             continue;
         }
 
         // We extract the entry from the analysis table and we schedule it 
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
         schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
     }
 
@@ -72,9 +69,8 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
 
     // We have to keep possible NOP due to dependencies out of the loop (otherwise they will waste resources every loop iteration) so we schedule them here together with BB0 instructions
     for (const int id : bb1_ids) { // iterate for all the bb1
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id); // we check the loop invariant dependencies to understand if we can already schedule the instruction at the loop beginning or if we need to push the loop beginning later
         for (const int dep_id : entry.interloop_dependencies) { // iterate for all the interloop dependencies
@@ -110,9 +106,8 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // Without loop.pip, the loop body has a single stage and the II equals the loop body length,
     // so we don't need modulo scheduling or the SlotTable here.
     for (const int id : bb1_non_loop_ids) {
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) continue; // sanity check
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue; // sanity check
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // We calculate the earliest cycle we can schedule the instruction based on its dependencies (local, loop invariant, and interloop dependencies)
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
@@ -150,7 +145,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     int ii = loop_cycle - loop_beginning + 1;
 
     // Check interloop constraints (equation 2). If violated, push the loop instruction down.
-    while (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table,
+    while (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_table,
                                             scheduled_cycle, kind_by_id, ii)) {
         schedule[loop_cycle].BRANCH = "nop";
         ++loop_cycle;
@@ -182,12 +177,10 @@ void schedule_bb2(const std::vector<DependencyAnalysisTableEntry>& analysis_tabl
 
     const int instruction_count = static_cast<int>(instructions.size());
 
-    // we need analysis_index_by_id and kind_by_id just like in the other schedulers
-    std::vector<int> analysis_index_by_id(instruction_count, -1);
+    // we need kind_by_id just like in the other schedulers
     std::vector<InstructionKind> kind_by_id(instruction_count, InstructionKind::Unknown);
     for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
         if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
-            analysis_index_by_id[analysis_table[i].id] = i;
             kind_by_id[analysis_table[i].id] = analysis_table[i].instruction_type;
         }
     }
@@ -215,10 +208,9 @@ void schedule_bb2(const std::vector<DependencyAnalysisTableEntry>& analysis_tabl
     // but with a minimum cycle of bb2_start and post-loop + loop-invariant dependencies
     for (int i = 0; i < instruction_count; ++i) {
         if (instructions[i].basic_block != BasicBlock::BB2) continue;
-        const int ai = analysis_index_by_id[i];
-        if (ai < 0) continue;
+        if (i < 0 || i >= static_cast<int>(analysis_table.size())) continue;
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[i];
 
         // compute the earliest cycle from local dependencies
         int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
@@ -264,7 +256,6 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     schedule.clear();
     const int instruction_count = static_cast<int>(instructions.size());
 
-    std::vector<int> analysis_index_by_id(static_cast<size_t>(instruction_count), -1);
     std::vector<InstructionKind> kind_by_id(static_cast<size_t>(instruction_count), InstructionKind::Unknown);
 
     std::vector<int> bb0_ids;
@@ -278,7 +269,6 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
         const DependencyAnalysisTableEntry& entry = analysis_table[analysis_index];
         if (entry.id < 0 || entry.id >= instruction_count) continue; // Sanity check
 
-        analysis_index_by_id[entry.id] = analysis_index;
         kind_by_id[entry.id] = entry.instruction_type;
 
         // depending on the bb type it belongs we put in the corrisponding vector
@@ -295,9 +285,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     // BB0 scheduling
     for (const int id : bb0_ids) {
 
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
         schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
     }
 
@@ -305,9 +294,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     int loop_beginning = static_cast<int>(schedule.size());
 
     for (const int id : bb1_ids) {
-        const int entry_index = analysis_index_by_id[id];
-        if (entry_index < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id);
         for (const int dep_id : entry.interloop_dependencies) {
@@ -353,9 +341,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
         bool failed = false; // this flag will be set to true if we find an instruction that cannot be scheduled with the current II, so we have to try again with a higher II
 
         for (const int id : bb1_non_loop_ids) {
-            const int entry_index = analysis_index_by_id[id];
-            if (entry_index < 0) continue;
-            const DependencyAnalysisTableEntry& entry = analysis_table[entry_index];
+            if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+            const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
             int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
             earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
@@ -412,7 +399,7 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
 
         // Validate all interloop constraints that couldn't be checked during scheduling
         // (producers that appear after their consumer in program order)
-        if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_index_by_id, analysis_table,
+        if (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_table,
                                              scheduled_cycle, kind_by_id, ii)) {
             ii++;
             if (ii > 100) throw std::runtime_error("Scheduling failed: exceeded reasonable II limit.");
