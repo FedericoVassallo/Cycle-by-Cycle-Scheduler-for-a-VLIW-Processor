@@ -3,6 +3,9 @@
 #include <algorithm>
 
 // version using loop (without loop.pip)
+// input analysis_table is the result of the dependency analysis on the input program, containing all the useful information about dependencies and instruction types for the scheduling
+// schedule is the output schedule vector we are building, where each entry is a bundle of instructions scheduled in the same cycle
+// scheduled_cycle is a vector that for each instruction id gives the cycle where it is scheduled (or -1 if it is not scheduled yet)
 void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                          std::vector<Bundle>& schedule,
                          const std::vector<Instruction>& instructions,
@@ -11,7 +14,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // We clear the schedule vector for rubustness (already supposed to be empty)
     schedule.clear();
 
-    // Compute the instruction count 
+    // we save the number of instructions to schedule
     const int instruction_count = static_cast<int>(instructions.size());
 
     // Preallocate vectors for which we know the size (instruction_count) and initialize them to undefined values (-1 and Unknown)
