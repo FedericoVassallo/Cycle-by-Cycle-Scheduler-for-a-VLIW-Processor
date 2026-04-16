@@ -17,8 +17,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // we save the number of instructions to schedule
     const int instruction_count = static_cast<int>(instructions.size());
 
-    // Preallocate vectors for which we know the size (instruction_count) and initialize them to undefined values (-1 and Unknown)
-    // To easily extract information on an instruction based on the id 
+    // kind_by_id is a vector that for each instruction id gives the kind of the instruction, so we can easily access it during the scheduling without having to look for the instruction in the analysis table every time
     std::vector<InstructionKind> kind_by_id(static_cast<size_t>(instruction_count), InstructionKind::Unknown);
 
     // Defining the vectors where we'll store the different ids of the belonging instructions 
@@ -28,11 +27,10 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // this is a vector of boolean of lenght = instr count and that initially is set to false
     std::vector<bool> is_bb1(instruction_count, false); // To quickly check if an instruction belongs to BB1
 
-    // We analyse all the instructions in the dependency analysis table to allocate them in the different basic blocks and to extract useful information for 
-    // the scheduling (the kind of the instruction and the index of the entry of the analysis table based on the id of the instruction)
+    // in this block we chaterize and orginize the instructions based on the basic block they belong to and we fill the kind_by_id vector
     for (int analysis_index = 0; analysis_index < static_cast<int>(analysis_table.size()); ++analysis_index) {
 
-        // We extract an entry from the dependency table 
+        // loop through all dependency analysis entries
         const DependencyAnalysisTableEntry& entry = analysis_table[analysis_index];
         if (entry.id < 0 || entry.id >= instruction_count) {
             continue;
@@ -49,21 +47,21 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         }
     }
 
-    // Reset the scheduled_cycle vector
+    // initialize the scheduled_cycle vector
     scheduled_cycle.assign(static_cast<size_t>(instruction_count), -1);
 
-    // BB0 contains setup code, scheduled once before the loop body.
+    // we schedule all the BB0 instruction first
     for (const int id : bb0_ids) {
         if (id < 0 || id >= static_cast<int>(analysis_table.size())) {
             continue;
         }
 
-        // We extract the entry from the analysis table and we schedule it 
+        // we place the instruction in the schedule using the schedule_entry_no_modulo function
         const DependencyAnalysisTableEntry& entry = analysis_table[id];
         schedule_entry_no_modulo(entry, instructions, schedule, scheduled_cycle, kind_by_id);
     }
 
-    // this is an optimistic ipothesis to put the loop beginning exactly after the last BB0 instr
+    // this is an initial guess to put the loop beginning exactly after the last BB0 instr
     // if needed we will update it later
     int loop_beginning = static_cast<int>(schedule.size());
 
@@ -72,6 +70,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
         const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
+        // the bb0_ready is the earliest cycle when that BB1 instruction could start, considering values coming from outside the loop
         int bb0_ready = max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id); // we check the loop invariant dependencies to understand if we can already schedule the instruction at the loop beginning or if we need to push the loop beginning later
         for (const int dep_id : entry.interloop_dependencies) { // iterate for all the interloop dependencies
             if (dep_id >= 0 && dep_id < instruction_count &&
@@ -142,7 +141,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     scheduled_cycle[loop_id] = loop_cycle;
 
     // We compute the length of the loop body (ii in this case)
-    int ii = loop_cycle - loop_beginning + 1;
+    int ii = loop_cycle - loop_beginning + 1; // loop_cycle is the cycle where we placed the loop instr
 
     // Check interloop constraints (equation 2). If violated, push the loop instruction down.
     while (!interloop_constraints_satisfied(bb1_ids, is_bb1, analysis_table,
