@@ -13,15 +13,6 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
 
     const int instruction_count = static_cast<int>(instructions.size());
 
-    // we need a fast way to go from instruction id -> its row in the analysis table
-    // analysis_index_by_id[5] = 3 means instruction 5's dependency info is at analysis_table[3]
-    std::vector<int> analysis_index_by_id(instruction_count, -1);
-    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
-        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
-            analysis_index_by_id[analysis_table[i].id] = i;
-        }
-    }
-
     // when two instructions are scheduled in the same cycle, we need to know
     // which one comes first. the bundle has a fixed slot order:
     // ALU0, ALU1, MUL, MEM, BRANCH
@@ -83,7 +74,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     // this eliminates all anti-dependencies and output dependencies
     // because every instruction now writes to a different register
     int next_reg = 1;
-    std::vector<int> new_dest_reg(instruction_count, -1);
+    std::vector<int> new_dest_reg(instruction_count, -1); // pre-allocate with -1 meaning "no register assigned" for sanity checks
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
@@ -115,15 +106,14 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
-        const int ai = analysis_index_by_id[id];
 
         // if the instruction has no sources or no analysis entry, nothing to do
-        if (ai < 0 || instr.source_registers.empty()) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
             new_source_regs[id] = {};
             continue;
         }
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // merge all four dependency lists into one flat list
         // this makes the search below simpler — we just scan one list
@@ -149,29 +139,17 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
             for (const int dep_id : all_deps) {
                 if (dep_id < 0 || dep_id >= instruction_count) continue;
                 if (instructions[dep_id].destination_register != src_reg) continue;
-
-                if (instr.basic_block == BasicBlock::BB2) {
-                    // BB2 prefers BB1 producers
-                    if (instructions[dep_id].basic_block == BasicBlock::BB1) {
-                        if (best_producer == -1 || !found_preferred) {
-                            best_producer = dep_id;
-                            found_preferred = true;
-                        }
-                    } else if (!found_preferred) {
+                if (instructions[dep_id].basic_block == preferred_bb) {
+                    // For BB0 preference, choose the latest-scheduled producer.
+                    // For BB1 preference, first match is enough.
+                    if (!found_preferred ||
+                        (preferred_bb == BasicBlock::BB0 && scheduled_cycle[dep_id] > scheduled_cycle[best_producer])) {
                         best_producer = dep_id;
+                        found_preferred = true;
                     }
-                } else {
-                    // BB1 and BB0 prefer BB0 producers, and among BB0 pick the latest scheduled
-                    if (instructions[dep_id].basic_block == BasicBlock::BB0) {
-                        if (!found_preferred || scheduled_cycle[dep_id] > scheduled_cycle[best_producer]) {
-                            best_producer = dep_id;
-                            found_preferred = true;
-                        }
-                    } else if (!found_preferred) {
-                        if (best_producer == -1) {
-                            best_producer = dep_id;
-                        }
-                    }
+                } else if (!found_preferred && best_producer == -1) {
+                    // Keep one fallback candidate until a preferred producer is found.
+                    best_producer = dep_id;
                 }
             }
 
@@ -229,15 +207,16 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         // only BB1 instructions can have interloop dependencies
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
 
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // for each source register this BB1 instruction reads...
         for (const int src_reg : instructions[id].source_registers) {
             int bb0_producer = -1;
             int bb1_producer = -1;
 
+            // We define the producer of this register as the instruction that writes to it and is closest to the consumer in the 
+            // schedule order (i.e. the latest scheduled producer in BB0, in BB1 it doesn't count).
             auto search_deps = [&](const std::vector<int>& deps) {
                 for (const int dep_id : deps) {
                     if (dep_id < 0 || dep_id >= instruction_count) continue;
@@ -254,18 +233,23 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
                 }
             };
 
+            // We update bb0_producer and bb1_producer by looking at all the dependencies of the consumer instruction (local, interloop, and loop invariant) 
+            // to find which instruction produces the value read by the consumer in BB0 and in BB1.
             search_deps(entry.local_dependencies);
             search_deps(entry.interloop_dependencies);
             search_deps(entry.loop_invariant_dependencies);
 
-            // we only need a mov when BOTH BB0 and BB1 produce the same register
+            // we only need a mov when BOTH BB0 and BB1 producers produce the same register (we have a conflict!!)
             // if only one produces it, there's no conflict to resolve
             if (bb0_producer != -1 && bb1_producer != -1 &&
                 new_dest_reg[bb0_producer] != -1 && new_dest_reg[bb1_producer] != -1) {
 
-                // don't add the same mov pair twice
+                // don't add the same mov pair twice, so we check if it's already in the list before adding 
+                // (in case multiple instructions read the same register and have the same producers, we only need one mov)
                 bool already_added = false;
                 for (const auto& mp : mov_pairs) {
+                    // These are the two regusters that are moved (we check if they are already in the list, 
+                    // otherwise we put them in the list to add the mov later)
                     if (mp.dest_reg == new_dest_reg[bb0_producer] && mp.src_reg == new_dest_reg[bb1_producer]) {
                         already_added = true;
                         break;
@@ -278,12 +262,13 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         }
     }
 
-    // now place each mov in the schedule
+    // WE PLACE THE MOV IN THE SCHEDULE:
     // the mov reads from the BB1 producer, so it must respect the producer's latency
     // we try to place it as late as possible (near the loop instruction)
     // if there's no room, we push the loop instruction down
     for (const auto& mp : mov_pairs) {
         // the mov can't execute before the BB1 producer's result is ready
+        // it's this result that we have to mov later into the BB0 register, so we have to wait for it to be ready.
         int earliest_mov = scheduled_cycle[mp.bb1_prod_id] + instruction_latency(instructions[mp.bb1_prod_id].kind);
 
         while (true) {
@@ -348,7 +333,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
         for (int s = 0; s < static_cast<int>(new_source_regs[id].size()); ++s) {
-            if (new_source_regs[id][s] == -1) {
+            if (new_source_regs[id][s] == -1) { // this source register was unresolved in Phase 2, so it's an orphan that needs a new register
                 int orig_reg = instr.source_registers[s];
                 // check if we already assigned a register for this orphan
                 if (orphan_reg_map.find(orig_reg) != orphan_reg_map.end()) {
@@ -376,6 +361,8 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         // BB2 isn't in the schedule yet — skip it
         if (instr.basic_block == BasicBlock::BB2) continue;
 
+        // Extract the cycle at which this instruction is scheduled
+        // We'll need it to update the right bundle later 
         int cycle = scheduled_cycle[id];
         if (cycle < 0) continue;
 
@@ -387,6 +374,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         }
 
         // mov to LC/EC: the text is something like "mov LC, 100" — nothing to change
+        // These kinds of instructions have destination_register == -1.
         if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
 
         // rebuild the instruction text with the new registers
@@ -459,14 +447,6 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
                     const std::vector<int>& stage_by_id) {
 
     const int instruction_count = static_cast<int>(instructions.size());
-
-    // same lookup table as alloc_b: instruction id -> analysis table row
-    std::vector<int> analysis_index_by_id(instruction_count, -1);
-    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
-        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
-            analysis_index_by_id[analysis_table[i].id] = i;
-        }
-    }
 
     // same slot priority and ordering as alloc_b
     auto slot_priority = [](InstructionKind kind) -> int {
@@ -555,9 +535,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
     std::vector<bool> is_interloop_initializer(instruction_count, false);
     for (const int id : ordered_ids) {
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // group BB0 interloop deps by the register they write
         // only the latest one per register is the true initializer
@@ -581,9 +560,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
     std::vector<bool> invariant_assigned(instruction_count, false);
     for (const int id : ordered_ids) {
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         for (const int dep_id : entry.loop_invariant_dependencies) {
             if (dep_id < 0 || dep_id >= instruction_count) continue;
@@ -610,9 +588,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
-        const int ai = analysis_index_by_id[id];
 
-        if (ai < 0 || instr.source_registers.empty()) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
             new_source_regs[id] = {};
             continue;
         }
@@ -626,7 +603,7 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
             continue;
         }
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
         int consumer_stage = stage_by_id[id];
 
         for (const int src_reg : instr.source_registers) {
@@ -716,9 +693,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
         // listed as an interloop dependency consumer of this BB0 instruction
         for (const int consumer_id : ordered_ids) {
             if (instructions[consumer_id].basic_block != BasicBlock::BB1) continue;
-            const int ai = analysis_index_by_id[consumer_id];
-            if (ai < 0) continue;
-            const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+            if (consumer_id < 0 || consumer_id >= static_cast<int>(analysis_table.size())) continue;
+            const DependencyAnalysisTableEntry& entry = analysis_table[consumer_id];
 
             for (const int dep_id : entry.interloop_dependencies) {
                 if (dep_id != id) continue; // we want the entry that lists THIS bb0 instruction
@@ -773,13 +749,12 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
         const Instruction& instr = instructions[id];
         if (instr.basic_block == BasicBlock::BB1) continue; // already done in Phase 3
 
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0 || instr.source_registers.empty()) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
             if (new_source_regs[id].empty()) new_source_regs[id] = {};
             continue;
         }
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // rebuild source regs for this instruction
         new_source_regs[id].clear();

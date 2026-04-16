@@ -321,6 +321,7 @@ bool try_bb1_schedule_with_ii(const std::vector<int>& bb1_ids,
     return true;
 }
 
+// We write again the intruction text after the register allocation 
 std::string rebuild_instruction_text(const Instruction& instr, int new_dest, const std::vector<int>& new_sources) {
     std::string text;
 
