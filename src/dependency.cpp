@@ -78,12 +78,33 @@ void dependency_analysis(const std::vector<Instruction>& instructions, std::vect
         }
 
         // Dependencies: Check next instructions for register usage to find interloop dependencies.
+        // IMPORTANT: if a local BB1 producer already satisfies a source register, skip it here.
+        // That local producer takes precedence in the current iteration; the later BB1 writer
+        // is an output/anti dependency on the local producer, not an interloop source for `instr`.
+        // Collect source registers already satisfied by a local BB1 dep.
+        std::vector<int> local_bb1_satisfied_regs;
+        if (instr.basic_block == BasicBlock::BB1) {
+            for (int k : entry.local_dependencies) {
+                if (k >= 0 && k < static_cast<int>(instructions.size()) &&
+                    instructions[k].destination_register != -1) {
+                    local_bb1_satisfied_regs.push_back(instructions[k].destination_register);
+                }
+            }
+        }
+
         for (int j = i; j < static_cast<int>(instructions.size()); ++j) { // We start from i because we want to include the current instruction as well, in case it is a producer for itself in the next loop 
             const Instruction& next_instr = instructions[j];
             if (next_instr.destination_register != -1) {
                 // Check if the next instruction reads from a register that is written by the current instruction.
                 if (std::find(instr.source_registers.begin(), instr.source_registers.end(), next_instr.destination_register) != instr.source_registers.end()) {
                     if (next_instr.basic_block == BasicBlock::BB1 && instr.basic_block == BasicBlock::BB1 && j >= i) {
+
+                        // Skip if a local BB1 producer already satisfies this source register in the current iteration.
+                        if (std::find(local_bb1_satisfied_regs.begin(), local_bb1_satisfied_regs.end(),
+                                      next_instr.destination_register) != local_bb1_satisfied_regs.end()) {
+                            continue;
+                        }
+
                         // If both instructions are in BB1 and the consumer is before the producer, it's an interloop dependency.
                         entry.interloop_dependencies.push_back(j);
 
