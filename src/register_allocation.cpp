@@ -361,6 +361,8 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         // BB2 isn't in the schedule yet — skip it
         if (instr.basic_block == BasicBlock::BB2) continue;
 
+        // Extract the cycle at which this instruction is scheduled
+        // We'll need it to update the right bundle later 
         int cycle = scheduled_cycle[id];
         if (cycle < 0) continue;
 
