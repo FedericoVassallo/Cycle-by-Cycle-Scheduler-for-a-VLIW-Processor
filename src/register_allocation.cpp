@@ -215,6 +215,8 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
             int bb0_producer = -1;
             int bb1_producer = -1;
 
+            // We define the producer of this register as the instruction that writes to it and is closest to the consumer in the 
+            // schedule order (i.e. the latest scheduled producer in BB0, in BB1 it doesn't count).
             auto search_deps = [&](const std::vector<int>& deps) {
                 for (const int dep_id : deps) {
                     if (dep_id < 0 || dep_id >= instruction_count) continue;
@@ -231,18 +233,23 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
                 }
             };
 
+            // We update bb0_producer and bb1_producer by looking at all the dependencies of the consumer instruction (local, interloop, and loop invariant) 
+            // to find which instruction produces the value read by the consumer in BB0 and in BB1.
             search_deps(entry.local_dependencies);
             search_deps(entry.interloop_dependencies);
             search_deps(entry.loop_invariant_dependencies);
 
-            // we only need a mov when BOTH BB0 and BB1 produce the same register
+            // we only need a mov when BOTH BB0 and BB1 producers produce the same register (we have a conflict!!)
             // if only one produces it, there's no conflict to resolve
             if (bb0_producer != -1 && bb1_producer != -1 &&
                 new_dest_reg[bb0_producer] != -1 && new_dest_reg[bb1_producer] != -1) {
 
-                // don't add the same mov pair twice
+                // don't add the same mov pair twice, so we check if it's already in the list before adding 
+                // (in case multiple instructions read the same register and have the same producers, we only need one mov)
                 bool already_added = false;
                 for (const auto& mp : mov_pairs) {
+                    // These are the two regusters that are moved (we check if they are already in the list, 
+                    // otherwise we put them in the list to add the mov later)
                     if (mp.dest_reg == new_dest_reg[bb0_producer] && mp.src_reg == new_dest_reg[bb1_producer]) {
                         already_added = true;
                         break;
@@ -255,12 +262,13 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         }
     }
 
-    // now place each mov in the schedule
+    // WE PLACE THE MOV IN THE SCHEDULE:
     // the mov reads from the BB1 producer, so it must respect the producer's latency
     // we try to place it as late as possible (near the loop instruction)
     // if there's no room, we push the loop instruction down
     for (const auto& mp : mov_pairs) {
         // the mov can't execute before the BB1 producer's result is ready
+        // it's this result that we have to mov later into the BB0 register, so we have to wait for it to be ready.
         int earliest_mov = scheduled_cycle[mp.bb1_prod_id] + instruction_latency(instructions[mp.bb1_prod_id].kind);
 
         while (true) {
@@ -325,7 +333,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
         for (int s = 0; s < static_cast<int>(new_source_regs[id].size()); ++s) {
-            if (new_source_regs[id][s] == -1) {
+            if (new_source_regs[id][s] == -1) { // this source register was unresolved in Phase 2, so it's an orphan that needs a new register
                 int orig_reg = instr.source_registers[s];
                 // check if we already assigned a register for this orphan
                 if (orphan_reg_map.find(orig_reg) != orphan_reg_map.end()) {
@@ -364,6 +372,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         }
 
         // mov to LC/EC: the text is something like "mov LC, 100" — nothing to change
+        // These kinds of instructions have destination_register == -1.
         if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
 
         // rebuild the instruction text with the new registers
