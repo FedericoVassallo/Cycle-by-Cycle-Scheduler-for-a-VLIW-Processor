@@ -368,7 +368,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
                 // we skip if the producer is not skeduled yet (it means that the producer is after the consumer in program order, so we will check the constraint later when we will have scheduled the producer)
                 if (scheduled_cycle[dep_id] < 0) continue;
 
-                // we apply the equation 2 to update the earliest cycle where we can schedule the instruction based on the producer cycle, the producer latency and the current II 
+                // we apply the equation 2 to update the earliest cycle where we can schedule the 
+                // instruction based on the producer cycle, the producer latency and the current II 
                 int prod_cycle = scheduled_cycle[dep_id];
                 int prod_latency = instruction_latency(kind_by_id[dep_id]);
                 
@@ -380,8 +381,10 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
 
             int cycle = earliest;
             while (true) { 
-                if (cycle > loop_beginning + ii * 20) { // sanity check to avoid infinite loops in case of bugs (we allow to go up to 20 II windows after the loop beginning, which should be more than enough for any reasonable schedule)
-                    failed = true;
+                if (cycle > loop_beginning + ii * 20) { // sanity check to avoid infinite loops in case of bugs 
+                    //(we allow to go up to 20 II windows after the loop beginning, which should be more than enough 
+                    //for any reasonable schedule)
+                    failed = true;  
                     break;
                 }
                 ensure_bundle_capacity(schedule, cycle);
