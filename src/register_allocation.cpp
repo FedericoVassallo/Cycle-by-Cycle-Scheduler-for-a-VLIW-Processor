@@ -74,7 +74,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     // this eliminates all anti-dependencies and output dependencies
     // because every instruction now writes to a different register
     int next_reg = 1;
-    std::vector<int> new_dest_reg(instruction_count, -1);
+    std::vector<int> new_dest_reg(instruction_count, -1); // pre-allocate with -1 meaning "no register assigned" for sanity checks
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
@@ -139,29 +139,17 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
             for (const int dep_id : all_deps) {
                 if (dep_id < 0 || dep_id >= instruction_count) continue;
                 if (instructions[dep_id].destination_register != src_reg) continue;
-
-                if (instr.basic_block == BasicBlock::BB2) {
-                    // BB2 prefers BB1 producers
-                    if (instructions[dep_id].basic_block == BasicBlock::BB1) {
-                        if (best_producer == -1 || !found_preferred) {
-                            best_producer = dep_id;
-                            found_preferred = true;
-                        }
-                    } else if (!found_preferred) {
+                if (instructions[dep_id].basic_block == preferred_bb) {
+                    // For BB0 preference, choose the latest-scheduled producer.
+                    // For BB1 preference, first match is enough.
+                    if (!found_preferred ||
+                        (preferred_bb == BasicBlock::BB0 && scheduled_cycle[dep_id] > scheduled_cycle[best_producer])) {
                         best_producer = dep_id;
+                        found_preferred = true;
                     }
-                } else {
-                    // BB1 and BB0 prefer BB0 producers, and among BB0 pick the latest scheduled
-                    if (instructions[dep_id].basic_block == BasicBlock::BB0) {
-                        if (!found_preferred || scheduled_cycle[dep_id] > scheduled_cycle[best_producer]) {
-                            best_producer = dep_id;
-                            found_preferred = true;
-                        }
-                    } else if (!found_preferred) {
-                        if (best_producer == -1) {
-                            best_producer = dep_id;
-                        }
-                    }
+                } else if (!found_preferred && best_producer == -1) {
+                    // Keep one fallback candidate until a preferred producer is found.
+                    best_producer = dep_id;
                 }
             }
 
