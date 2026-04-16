@@ -13,15 +13,6 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
 
     const int instruction_count = static_cast<int>(instructions.size());
 
-    // we need a fast way to go from instruction id -> its row in the analysis table
-    // analysis_index_by_id[5] = 3 means instruction 5's dependency info is at analysis_table[3]
-    std::vector<int> analysis_index_by_id(instruction_count, -1);
-    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
-        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
-            analysis_index_by_id[analysis_table[i].id] = i;
-        }
-    }
-
     // when two instructions are scheduled in the same cycle, we need to know
     // which one comes first. the bundle has a fixed slot order:
     // ALU0, ALU1, MUL, MEM, BRANCH
@@ -115,15 +106,14 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
-        const int ai = analysis_index_by_id[id];
 
         // if the instruction has no sources or no analysis entry, nothing to do
-        if (ai < 0 || instr.source_registers.empty()) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
             new_source_regs[id] = {};
             continue;
         }
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // merge all four dependency lists into one flat list
         // this makes the search below simpler — we just scan one list
@@ -229,9 +219,8 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         // only BB1 instructions can have interloop dependencies
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
 
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // for each source register this BB1 instruction reads...
         for (const int src_reg : instructions[id].source_registers) {
@@ -460,14 +449,6 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
 
     const int instruction_count = static_cast<int>(instructions.size());
 
-    // same lookup table as alloc_b: instruction id -> analysis table row
-    std::vector<int> analysis_index_by_id(instruction_count, -1);
-    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
-        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
-            analysis_index_by_id[analysis_table[i].id] = i;
-        }
-    }
-
     // same slot priority and ordering as alloc_b
     auto slot_priority = [](InstructionKind kind) -> int {
         switch (kind) {
@@ -555,9 +536,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
     std::vector<bool> is_interloop_initializer(instruction_count, false);
     for (const int id : ordered_ids) {
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // group BB0 interloop deps by the register they write
         // only the latest one per register is the true initializer
@@ -581,9 +561,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
     std::vector<bool> invariant_assigned(instruction_count, false);
     for (const int id : ordered_ids) {
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         for (const int dep_id : entry.loop_invariant_dependencies) {
             if (dep_id < 0 || dep_id >= instruction_count) continue;
@@ -610,9 +589,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
-        const int ai = analysis_index_by_id[id];
 
-        if (ai < 0 || instr.source_registers.empty()) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
             new_source_regs[id] = {};
             continue;
         }
@@ -626,7 +604,7 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
             continue;
         }
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
         int consumer_stage = stage_by_id[id];
 
         for (const int src_reg : instr.source_registers) {
@@ -716,9 +694,8 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
         // listed as an interloop dependency consumer of this BB0 instruction
         for (const int consumer_id : ordered_ids) {
             if (instructions[consumer_id].basic_block != BasicBlock::BB1) continue;
-            const int ai = analysis_index_by_id[consumer_id];
-            if (ai < 0) continue;
-            const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+            if (consumer_id < 0 || consumer_id >= static_cast<int>(analysis_table.size())) continue;
+            const DependencyAnalysisTableEntry& entry = analysis_table[consumer_id];
 
             for (const int dep_id : entry.interloop_dependencies) {
                 if (dep_id != id) continue; // we want the entry that lists THIS bb0 instruction
@@ -773,13 +750,12 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
         const Instruction& instr = instructions[id];
         if (instr.basic_block == BasicBlock::BB1) continue; // already done in Phase 3
 
-        const int ai = analysis_index_by_id[id];
-        if (ai < 0 || instr.source_registers.empty()) {
+        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
             if (new_source_regs[id].empty()) new_source_regs[id] = {};
             continue;
         }
 
-        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const DependencyAnalysisTableEntry& entry = analysis_table[id];
 
         // rebuild source regs for this instruction
         new_source_regs[id].clear();
