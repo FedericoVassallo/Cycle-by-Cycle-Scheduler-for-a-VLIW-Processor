@@ -70,6 +70,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // if needed we will update it later
     int loop_beginning = static_cast<int>(schedule.size());
 
+    // We have to keep possible NOP due to dependencies out of the loop (otherwise they will waste resources every loop iteration) so we schedule them here together with BB0 instructions
     for (const int id : bb1_ids) { // iterate for all the bb1
         const int entry_index = analysis_index_by_id[id];
         if (entry_index < 0) continue;
@@ -130,11 +131,12 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     }
 
     // here it search for the last cycle where we scheduled a BB1 instruction
-    int last_bb1_cycle = loop_beginning;
+    int last_bb1_cycle = loop_beginning; // We start from here 
     for (const int id : bb1_non_loop_ids) {
         last_bb1_cycle = std::max(last_bb1_cycle, scheduled_cycle[id]);
     }
 
+    // We try to schedule the loop instruction at the end of the loop ASAP 
     int loop_cycle = last_bb1_cycle;
     while (true) {
         ensure_bundle_capacity(schedule, loop_cycle);
@@ -144,6 +146,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     place_in_bundle(schedule[loop_cycle], InstructionKind::Loop, instructions[loop_id].raw_text);
     scheduled_cycle[loop_id] = loop_cycle;
 
+    // We compute the length of the loop body (ii in this case)
     int ii = loop_cycle - loop_beginning + 1;
 
     // Check interloop constraints (equation 2). If violated, push the loop instruction down.
@@ -357,10 +360,6 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
             int earliest = max_ready_cycle(entry.local_dependencies, scheduled_cycle, kind_by_id);
             earliest = std::max(earliest, max_ready_cycle(entry.loop_invariant_dependencies, scheduled_cycle, kind_by_id));
             earliest = std::max(earliest, loop_beginning);
-
-            // TODO: also account for interloop dependencies where the producer is
-            // already scheduled in BB1, using equation 2 rearranged as a lower bound
-            // on the consumer cycle. Skip BB0 producers and unscheduled producers.
 
             for (const int dep_id : entry.interloop_dependencies) { // we iterate for all the interloop dependencies to check if they are scheduled in BB1 and if they are scheduled we apply the equation 2 to update the earliest cycle where we can schedule the instruction
                 // saity check
