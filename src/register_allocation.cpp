@@ -6,12 +6,556 @@
 #include <map>
 #include <string>
 
+namespace {
+
+// ============================================================================
+// Small helpers shared by alloc_b and alloc_r
+// ============================================================================
+
+// Returns true if this instruction should get a fresh destination register.
+// Excludes loop/loop.pip (no GP dest), mov to LC/EC (dest -1), stores (no dest).
+bool instr_needs_dest_register(const Instruction& instr) {
+    if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) return false;
+    if (instr.kind == InstructionKind::St) return false;
+    if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) return false;
+    return instr.destination_register != -1;
+}
+
+// Slot priority for breaking ties when two instructions share a cycle.
+// Matches the bundle layout: ALU0, ALU1, MUL, MEM, BRANCH.
+int slot_priority_of(InstructionKind kind) {
+    switch (kind) {
+        case InstructionKind::Add:
+        case InstructionKind::Addi:
+        case InstructionKind::Sub:
+        case InstructionKind::Mov:    return 0;
+        case InstructionKind::Mulu:   return 2;
+        case InstructionKind::Ld:
+        case InstructionKind::St:     return 3;
+        case InstructionKind::Loop:
+        case InstructionKind::LoopPip: return 4;
+        default:                       return 5;
+    }
+}
+
+// Build instruction ids in scheduling order (by cycle, then slot, then program order).
+// BB2 instructions (not yet scheduled, so scheduled_cycle[i] == -1) are appended at the end
+// in program order so they still get allocated.
+std::vector<int> build_ordered_ids(const std::vector<Instruction>& instructions,
+                                   const std::vector<int>& scheduled_cycle) {
+    const int n = static_cast<int>(instructions.size());
+    std::vector<int> ordered_ids;
+    for (int i = 0; i < n; ++i) {
+        if (scheduled_cycle[i] >= 0) ordered_ids.push_back(i);
+    }
+    std::sort(ordered_ids.begin(), ordered_ids.end(), [&](int a, int b) {
+        if (scheduled_cycle[a] != scheduled_cycle[b]) return scheduled_cycle[a] < scheduled_cycle[b];
+        int pa = slot_priority_of(instructions[a].kind);
+        int pb = slot_priority_of(instructions[b].kind);
+        if (pa != pb) return pa < pb;
+        return a < b;
+    });
+    for (int i = 0; i < n; ++i) {
+        if (instructions[i].basic_block == BasicBlock::BB2 && scheduled_cycle[i] < 0) {
+            ordered_ids.push_back(i);
+        }
+    }
+    return ordered_ids;
+}
+
+// Build a lookup table: instruction id -> row index in analysis_table.
+std::vector<int> build_analysis_index_by_id(
+    const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+    int instruction_count) {
+    std::vector<int> out(instruction_count, -1);
+    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
+        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
+            out[analysis_table[i].id] = i;
+        }
+    }
+    return out;
+}
+
+// Search a dependency list for a producer that writes `target_reg` and is in `target_bb`.
+// Returns the producer id, or -1 if none found.
+int find_producer_in(const std::vector<int>& deps,
+                     int target_reg,
+                     BasicBlock target_bb,
+                     const std::vector<Instruction>& instructions) {
+    const int n = static_cast<int>(instructions.size());
+    for (const int dep_id : deps) {
+        if (dep_id < 0 || dep_id >= n) continue;
+        if (instructions[dep_id].destination_register != target_reg) continue;
+        if (instructions[dep_id].basic_block != target_bb) continue;
+        return dep_id;
+    }
+    return -1;
+}
+
+// Search a dependency list for a producer writing `target_reg` (any BB). Returns id or -1.
+int find_producer_any_bb(const std::vector<int>& deps,
+                         int target_reg,
+                         const std::vector<Instruction>& instructions) {
+    const int n = static_cast<int>(instructions.size());
+    for (const int dep_id : deps) {
+        if (dep_id < 0 || dep_id >= n) continue;
+        if (instructions[dep_id].destination_register == target_reg) return dep_id;
+    }
+    return -1;
+}
+
+// Overwrite the bundle slot that currently holds `instr.raw_text` with `new_text`.
+// For ALU instructions the slot might be ALU0 or ALU1 — match on raw_text.
+// Other kinds (MUL, MEM, BRANCH) are unambiguous: each bundle has exactly one such slot.
+// If the slot can't be found (already rewritten, or not in this bundle), do nothing.
+void rewrite_bundle_slot(Bundle& bundle, const Instruction& instr, const std::string& new_text) {
+    if (is_alu_kind(instr.kind)) {
+        if (bundle.ALU0 == instr.raw_text) bundle.ALU0 = new_text;
+        else if (bundle.ALU1 == instr.raw_text) bundle.ALU1 = new_text;
+    } else if (instr.kind == InstructionKind::Mulu) {
+        bundle.MUL = new_text;
+    } else if (instr.kind == InstructionKind::Ld || instr.kind == InstructionKind::St) {
+        bundle.MEM = new_text;
+    }
+    // loop/loop.pip and nop/mov-to-LC-or-EC are handled by the callers explicitly.
+}
+
+// Walk the schedule and rewrite every placed instruction's text using the new
+// register names. BB2 instructions are skipped (they aren't in the schedule yet
+// when alloc_b runs — rewrite_bb2_bundles handles them later).
+// The loop instruction gets its branch target updated to `loop_beginning`.
+// mov to LC/EC keeps its original text (no GP register to rename).
+void apply_renaming_to_bundles(std::vector<Bundle>& schedule,
+                               const std::vector<int>& ordered_ids,
+                               const std::vector<Instruction>& instructions,
+                               const std::vector<int>& scheduled_cycle,
+                               const std::vector<int>& new_dest_reg,
+                               const std::vector<std::vector<int>>& new_source_regs,
+                               int loop_beginning,
+                               bool skip_bb2) {
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        if (skip_bb2 && instr.basic_block == BasicBlock::BB2) continue;
+
+        const int cycle = scheduled_cycle[id];
+        if (cycle < 0) continue;
+
+        // Loop instruction: branch target was relative to original program addresses;
+        // retarget it to the start of the scheduled loop body.
+        if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
+            schedule[cycle].BRANCH = instr.opcode + " " + std::to_string(loop_beginning);
+            continue;
+        }
+
+        // mov to LC/EC has no GP register to rename — keep raw text.
+        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
+
+        const std::string new_text = rebuild_instruction_text(
+            instr, new_dest_reg[id], new_source_regs[id]);
+        rewrite_bundle_slot(schedule[cycle], instr, new_text);
+    }
+}
+
+// Resolve source operands that are still -1 after the main allocation phases:
+// they read a register nobody writes (e.g. x0, or base addresses pre-loaded).
+// Two reads of the same original register must get the same new register.
+void resolve_orphan_sources(const std::vector<int>& ordered_ids,
+                            const std::vector<Instruction>& instructions,
+                            std::vector<std::vector<int>>& new_source_regs,
+                            int& next_reg) {
+    std::map<int, int> orphan_map;
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        for (size_t s = 0; s < new_source_regs[id].size(); ++s) {
+            if (new_source_regs[id][s] != -1) continue;
+            const int orig = instr.source_registers[s];
+            auto it = orphan_map.find(orig);
+            if (it != orphan_map.end()) {
+                new_source_regs[id][s] = it->second;
+            } else {
+                orphan_map[orig] = next_reg;
+                new_source_regs[id][s] = next_reg++;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// alloc_r phase helpers
+// ============================================================================
+//
+// alloc_r is split into small phases that match the four phases described in
+// PDF Section 3.3.2. Each helper takes the state it needs and updates
+// new_dest_reg / new_source_regs. next_static_reg is threaded by reference
+// because several phases draw from the same static register pool.
+
+// Phase 1: assign rotating registers (x32, x32+stride, ...) to BB1 destinations.
+void r_phase1_rotating_dests(const std::vector<int>& ordered_ids,
+                             const std::vector<Instruction>& instructions,
+                             int num_stages,
+                             std::vector<int>& new_dest_reg) {
+    const int stride = num_stages + 1;
+    int next_reg = 32;
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        if (!instr_needs_dest_register(instructions[id])) continue;
+        new_dest_reg[id] = next_reg;
+        next_reg += stride;
+    }
+}
+
+// Identify BB0 instructions that act as interloop initializers.
+// A BB0 instruction whose dest register is both in some BB1 consumer's
+// interloop_dependencies AND written again inside BB1 is an initializer.
+// When multiple BB0 instructions write the same register, only the latest
+// one (largest id) is the true initializer.
+std::vector<bool> r_find_interloop_initializers(
+    const std::vector<int>& ordered_ids,
+    const std::vector<Instruction>& instructions,
+    const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+    const std::vector<int>& analysis_index_by_id) {
+
+    const int n = static_cast<int>(instructions.size());
+    std::vector<bool> is_initializer(n, false);
+
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0) continue;
+
+        std::map<int, int> latest_bb0_per_reg; // dest reg -> latest BB0 id
+        for (const int dep_id : analysis_table[ai].interloop_dependencies) {
+            if (dep_id < 0 || dep_id >= n) continue;
+            if (instructions[dep_id].basic_block != BasicBlock::BB0) continue;
+            const int dreg = instructions[dep_id].destination_register;
+            if (dreg < 0) continue;
+            auto it = latest_bb0_per_reg.find(dreg);
+            if (it == latest_bb0_per_reg.end() || dep_id > it->second) {
+                latest_bb0_per_reg[dreg] = dep_id;
+            }
+        }
+        for (const auto& kv : latest_bb0_per_reg) is_initializer[kv.second] = true;
+    }
+    return is_initializer;
+}
+
+// Phase 2: assign static registers (x1, x2, ...) to pure loop invariant BB0 producers.
+// Skips BB0 instructions that are interloop initializers — those are handled in phase 4.
+void r_phase2_invariant_dests(const std::vector<int>& ordered_ids,
+                              const std::vector<Instruction>& instructions,
+                              const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                              const std::vector<int>& analysis_index_by_id,
+                              const std::vector<bool>& is_interloop_initializer,
+                              std::vector<int>& new_dest_reg,
+                              int& next_static_reg) {
+    const int n = static_cast<int>(instructions.size());
+    std::vector<bool> assigned(n, false);
+    for (const int id : ordered_ids) {
+        if (instructions[id].basic_block != BasicBlock::BB1) continue;
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0) continue;
+        for (const int dep_id : analysis_table[ai].loop_invariant_dependencies) {
+            if (dep_id < 0 || dep_id >= n) continue;
+            if (instructions[dep_id].basic_block != BasicBlock::BB0) continue;
+            if (is_interloop_initializer[dep_id]) continue;
+            if (assigned[dep_id]) continue;
+            new_dest_reg[dep_id] = next_static_reg++;
+            assigned[dep_id] = true;
+        }
+    }
+}
+
+// Resolve a single BB1 source operand against the dependency lists.
+// Returns the new register name, or -1 if no producer is known yet (orphan).
+// Applies equations 3 and 4 from PDF Section 3.3.2.
+int r_resolve_bb1_source(int src_reg,
+                         int consumer_stage,
+                         const DependencyAnalysisTableEntry& entry,
+                         const std::vector<Instruction>& instructions,
+                         const std::vector<int>& new_dest_reg,
+                         const std::vector<int>& stage_by_id) {
+
+    // 1. Loop invariant — use the static register directly (no offset).
+    int p = find_producer_any_bb(entry.loop_invariant_dependencies, src_reg, instructions);
+    if (p != -1 && new_dest_reg[p] != -1) return new_dest_reg[p];
+
+    // 2. Local dep (same iteration) — equation 3: dest + (St(consumer) - St(producer)).
+    p = find_producer_any_bb(entry.local_dependencies, src_reg, instructions);
+    if (p != -1 && new_dest_reg[p] != -1) {
+        return new_dest_reg[p] + (consumer_stage - stage_by_id[p]);
+    }
+
+    // 3. Interloop dep with BB1 producer — equation 4: dest + (St(consumer) - St(producer)) + 1.
+    p = find_producer_in(entry.interloop_dependencies, src_reg, BasicBlock::BB1, instructions);
+    if (p != -1 && new_dest_reg[p] != -1) {
+        return new_dest_reg[p] + (consumer_stage - stage_by_id[p]) + 1;
+    }
+
+    // 4. Interloop dep with BB0 initializer — use the matching BB1 producer's name.
+    //    The consumer physically reads the BB0-initializer's register, but because
+    //    phase 4 will set that register to equal the BB1 producer's name with offsets,
+    //    we compute the same expression as case 3 using the BB1 producer.
+    int bb0 = find_producer_in(entry.interloop_dependencies, src_reg, BasicBlock::BB0, instructions);
+    if (bb0 != -1) {
+        p = find_producer_in(entry.interloop_dependencies, src_reg, BasicBlock::BB1, instructions);
+        if (p != -1 && new_dest_reg[p] != -1) {
+            return new_dest_reg[p] + (consumer_stage - stage_by_id[p]) + 1;
+        }
+    }
+
+    return -1;
+}
+
+// Phase 3: resolve source operands of BB1 instructions.
+// BB0/BB2 operands are left as placeholders (-1) for phase 4 to fill in.
+void r_phase3_bb1_sources(const std::vector<int>& ordered_ids,
+                          const std::vector<Instruction>& instructions,
+                          const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                          const std::vector<int>& analysis_index_by_id,
+                          const std::vector<int>& new_dest_reg,
+                          const std::vector<int>& stage_by_id,
+                          std::vector<std::vector<int>>& new_source_regs) {
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0 || instr.source_registers.empty()) {
+            new_source_regs[id] = {};
+            continue;
+        }
+        if (instr.basic_block != BasicBlock::BB1) {
+            new_source_regs[id].assign(instr.source_registers.size(), -1);
+            continue;
+        }
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        const int consumer_stage = stage_by_id[id];
+        for (const int src_reg : instr.source_registers) {
+            new_source_regs[id].push_back(
+                r_resolve_bb1_source(src_reg, consumer_stage, entry,
+                                     instructions, new_dest_reg, stage_by_id));
+        }
+    }
+}
+
+// For a given BB0 initializer instruction, find the corresponding BB1 producer
+// of the same register. Returns the BB1 producer's id, or -1 if not found.
+int r_find_bb1_producer_for_initializer(int bb0_id,
+                                        const std::vector<int>& ordered_ids,
+                                        const std::vector<Instruction>& instructions,
+                                        const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                                        const std::vector<int>& analysis_index_by_id,
+                                        const std::vector<int>& new_dest_reg) {
+    const int n = static_cast<int>(instructions.size());
+    const int orig_dest = instructions[bb0_id].destination_register;
+    if (orig_dest == -1) return -1;
+
+    for (const int consumer_id : ordered_ids) {
+        if (instructions[consumer_id].basic_block != BasicBlock::BB1) continue;
+        const int ai = analysis_index_by_id[consumer_id];
+        if (ai < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+
+        // Only check consumers that actually list this BB0 instruction as an interloop dep.
+        if (std::find(entry.interloop_dependencies.begin(),
+                      entry.interloop_dependencies.end(), bb0_id) == entry.interloop_dependencies.end()) {
+            continue;
+        }
+
+        for (const int other_dep : entry.interloop_dependencies) {
+            if (other_dep < 0 || other_dep >= n) continue;
+            if (instructions[other_dep].basic_block != BasicBlock::BB1) continue;
+            if (instructions[other_dep].destination_register != orig_dest) continue;
+            if (new_dest_reg[other_dep] == -1) continue;
+            return other_dep;
+        }
+    }
+    return -1;
+}
+
+// Phase 4a: assign destination registers for BB0 interloop initializers.
+// Their name must line up with the rotating BB1 producer so iteration 1 reads the right value.
+void r_phase4_bb0_initializer_dests(const std::vector<int>& ordered_ids,
+                                    const std::vector<Instruction>& instructions,
+                                    const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                                    const std::vector<int>& analysis_index_by_id,
+                                    const std::vector<bool>& is_interloop_initializer,
+                                    const std::vector<int>& stage_by_id,
+                                    std::vector<int>& new_dest_reg) {
+    const int n = static_cast<int>(instructions.size());
+    for (int id = 0; id < n; ++id) {
+        if (instructions[id].basic_block != BasicBlock::BB0) continue;
+        if (!is_interloop_initializer[id]) continue;
+        if (new_dest_reg[id] != -1) continue;
+
+        int bb1_producer = r_find_bb1_producer_for_initializer(
+            id, ordered_ids, instructions, analysis_table, analysis_index_by_id, new_dest_reg);
+        if (bb1_producer != -1) {
+            // dest = BB1_producer_reg + 1 - St(BB1_producer)
+            new_dest_reg[id] = new_dest_reg[bb1_producer] + 1 - stage_by_id[bb1_producer];
+        }
+    }
+}
+
+// Phase 4b: assign static regs to remaining BB0 and BB2 destinations.
+void r_phase4_static_dests(const std::vector<int>& ordered_ids,
+                           const std::vector<Instruction>& instructions,
+                           std::vector<int>& new_dest_reg,
+                           int& next_static_reg) {
+    for (const int id : ordered_ids) {
+        const BasicBlock bb = instructions[id].basic_block;
+        if (bb != BasicBlock::BB0 && bb != BasicBlock::BB2) continue;
+        if (new_dest_reg[id] != -1) continue;
+        if (!instr_needs_dest_register(instructions[id])) continue;
+        new_dest_reg[id] = next_static_reg++;
+    }
+}
+
+// Phase 4c: resolve source operands of BB0 and BB2 instructions.
+void r_phase4_bb0_bb2_sources(const std::vector<int>& ordered_ids,
+                              const std::vector<Instruction>& instructions,
+                              const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                              const std::vector<int>& analysis_index_by_id,
+                              const std::vector<int>& new_dest_reg,
+                              const std::vector<int>& stage_by_id,
+                              int num_stages,
+                              std::vector<std::vector<int>>& new_source_regs) {
+
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        if (instr.basic_block == BasicBlock::BB1) continue;
+
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0 || instr.source_registers.empty()) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+
+        new_source_regs[id].clear();
+        for (const int src_reg : instr.source_registers) {
+            int resolved = -1;
+
+            if (instr.basic_block == BasicBlock::BB0) {
+                // BB0: only local deps within BB0 matter.
+                int p = find_producer_any_bb(entry.local_dependencies, src_reg, instructions);
+                if (p != -1 && new_dest_reg[p] != -1) resolved = new_dest_reg[p];
+            } else {
+                // BB2: try post-loop → loop-invariant → local (in that order).
+                int p = find_producer_in(entry.post_loop_dependencies, src_reg, BasicBlock::BB1, instructions);
+                if (p != -1 && new_dest_reg[p] != -1) {
+                    // iter offset 0, stage offset (num_stages - 1) - St(producer)
+                    resolved = new_dest_reg[p] + (num_stages - 1) - stage_by_id[p];
+                }
+                if (resolved == -1) {
+                    p = find_producer_any_bb(entry.loop_invariant_dependencies, src_reg, instructions);
+                    if (p != -1 && new_dest_reg[p] != -1) resolved = new_dest_reg[p];
+                }
+                if (resolved == -1) {
+                    p = find_producer_any_bb(entry.local_dependencies, src_reg, instructions);
+                    if (p != -1 && new_dest_reg[p] != -1) resolved = new_dest_reg[p];
+                }
+            }
+
+            new_source_regs[id].push_back(resolved);
+        }
+    }
+}
+
+// Final pass: any remaining -1 source is an orphan — handled by resolve_orphan_sources.
+
+} // anonymous namespace
+
+// ============================================================================
+// alloc_b phase helpers
+// ============================================================================
+
+// alloc_b Phase 2: for each instruction, find the producer of each source register
+// in any of the four dependency lists and wire the source to the producer's new reg.
+// Preference rules (these matter when a register has two producers):
+//   * BB1 consumers: prefer the BB0 producer (loop body will mov BB1-result into it).
+//                    Among BB0 producers, pick the one scheduled latest.
+//                    Among non-BB0 producers: keep the first one seen.
+//   * BB2 consumers: prefer the BB1 producer (BB2 wants the final iteration's value).
+//                    Among non-BB1 producers: keep the last one seen (overwrites each pass).
+// If no producer is found the source is left as -1 (resolved as an orphan later).
+void b_phase2_resolve_sources(const std::vector<int>& ordered_ids,
+                              const std::vector<Instruction>& instructions,
+                              const std::vector<DependencyAnalysisTableEntry>& analysis_table,
+                              const std::vector<int>& analysis_index_by_id,
+                              const std::vector<int>& scheduled_cycle,
+                              const std::vector<int>& new_dest_reg,
+                              std::vector<std::vector<int>>& new_source_regs) {
+
+    const int n = static_cast<int>(instructions.size());
+
+    for (const int id : ordered_ids) {
+        const Instruction& instr = instructions[id];
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0 || instr.source_registers.empty()) {
+            new_source_regs[id] = {};
+            continue;
+        }
+
+        // Collect all deps into one flat list so the search below is a simple scan.
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
+        std::vector<int> all_deps;
+        all_deps.insert(all_deps.end(), entry.local_dependencies.begin(),          entry.local_dependencies.end());
+        all_deps.insert(all_deps.end(), entry.interloop_dependencies.begin(),      entry.interloop_dependencies.end());
+        all_deps.insert(all_deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
+        all_deps.insert(all_deps.end(), entry.post_loop_dependencies.begin(),      entry.post_loop_dependencies.end());
+
+        const BasicBlock preferred = (instr.basic_block == BasicBlock::BB2)
+                                     ? BasicBlock::BB1 : BasicBlock::BB0;
+        // For BB1/BB0 consumers: fallback picks the FIRST non-preferred dep (break ties early).
+        // For BB2 consumers: fallback picks the LAST non-preferred dep (overwrite on each pass).
+        const bool fallback_keeps_first = (instr.basic_block != BasicBlock::BB2);
+
+        for (const int src_reg : instr.source_registers) {
+            int best = -1;
+            bool best_is_preferred = false;
+
+            for (const int dep_id : all_deps) {
+                if (dep_id < 0 || dep_id >= n) continue;
+                if (instructions[dep_id].destination_register != src_reg) continue;
+
+                const BasicBlock dep_bb = instructions[dep_id].basic_block;
+
+                if (dep_bb == preferred) {
+                    // Preferred producer wins. For BB1 consumers (preferred=BB0), keep the
+                    // latest-scheduled one; for BB2 consumers, just keep the first one.
+                    if (!best_is_preferred) {
+                        best = dep_id;
+                        best_is_preferred = true;
+                    } else if (preferred == BasicBlock::BB0 &&
+                               scheduled_cycle[dep_id] > scheduled_cycle[best]) {
+                        best = dep_id;
+                    }
+                } else if (!best_is_preferred) {
+                    if (fallback_keeps_first) {
+                        if (best == -1) best = dep_id;
+                    } else {
+                        best = dep_id; // BB2: last non-preferred wins
+                    }
+                }
+            }
+
+            new_source_regs[id].push_back(
+                (best != -1 && new_dest_reg[best] != -1) ? new_dest_reg[best] : -1);
+        }
+    }
+}
+
 AllocResult alloc_b(std::vector<Bundle>& schedule,
                     const std::vector<DependencyAnalysisTableEntry>& analysis_table,
                     const std::vector<Instruction>& instructions,
                     std::vector<int>& scheduled_cycle) { // not const because Phase 3 may push the loop down and update its cycle
 
     const int instruction_count = static_cast<int>(instructions.size());
+
+    // we need a fast way to go from instruction id -> its row in the analysis table
+    // analysis_index_by_id[5] = 3 means instruction 5's dependency info is at analysis_table[3]
+    std::vector<int> analysis_index_by_id(instruction_count, -1);
+    for (int i = 0; i < static_cast<int>(analysis_table.size()); ++i) {
+        if (analysis_table[i].id >= 0 && analysis_table[i].id < instruction_count) {
+            analysis_index_by_id[analysis_table[i].id] = i;
+        }
+    }
 
     // when two instructions are scheduled in the same cycle, we need to know
     // which one comes first. the bundle has a fixed slot order:
@@ -74,7 +618,7 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     // this eliminates all anti-dependencies and output dependencies
     // because every instruction now writes to a different register
     int next_reg = 1;
-    std::vector<int> new_dest_reg(instruction_count, -1); // pre-allocate with -1 meaning "no register assigned" for sanity checks
+    std::vector<int> new_dest_reg(instruction_count, -1);
 
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
@@ -99,69 +643,10 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     // ========================================================================
     // PHASE 2: link each source operand to the new register of its producer
     // ========================================================================
-    // for each instruction, we look at what registers it reads (source_registers)
-    // then we search the dependency table to find which instruction wrote that register
-    // and we replace the source with that producer's newly assigned register from Phase 1
     std::vector<std::vector<int>> new_source_regs(instruction_count);
-
-    for (const int id : ordered_ids) {
-        const Instruction& instr = instructions[id];
-
-        // if the instruction has no sources or no analysis entry, nothing to do
-        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
-            new_source_regs[id] = {};
-            continue;
-        }
-
-        const DependencyAnalysisTableEntry& entry = analysis_table[id];
-
-        // merge all four dependency lists into one flat list
-        // this makes the search below simpler — we just scan one list
-        std::vector<int> all_deps;
-        all_deps.insert(all_deps.end(), entry.local_dependencies.begin(), entry.local_dependencies.end());
-        all_deps.insert(all_deps.end(), entry.interloop_dependencies.begin(), entry.interloop_dependencies.end());
-        all_deps.insert(all_deps.end(), entry.loop_invariant_dependencies.begin(), entry.loop_invariant_dependencies.end());
-        all_deps.insert(all_deps.end(), entry.post_loop_dependencies.begin(), entry.post_loop_dependencies.end());
-
-        // for each source register this instruction reads...
-        for (const int src_reg : instr.source_registers) {
-            int best_producer = -1;
-            bool found_preferred = false;
-
-            // BB1 consumers with two producers (BB0 + BB1) should prefer BB0
-            // because the mov at end of loop body will copy BB1's value into BB0's register
-            //
-            // BB2 consumers should prefer BB1 producers
-            // because BB2 runs after the last iteration and wants the final value from BB1
-            BasicBlock preferred_bb = (instr.basic_block == BasicBlock::BB2) ? BasicBlock::BB1 : BasicBlock::BB0;
-
-            // scan all dependencies to find who produces this source register
-            for (const int dep_id : all_deps) {
-                if (dep_id < 0 || dep_id >= instruction_count) continue;
-                if (instructions[dep_id].destination_register != src_reg) continue;
-                if (instructions[dep_id].basic_block == preferred_bb) {
-                    // For BB0 preference, choose the latest-scheduled producer.
-                    // For BB1 preference, first match is enough.
-                    if (!found_preferred ||
-                        (preferred_bb == BasicBlock::BB0 && scheduled_cycle[dep_id] > scheduled_cycle[best_producer])) {
-                        best_producer = dep_id;
-                        found_preferred = true;
-                    }
-                } else if (!found_preferred && best_producer == -1) {
-                    // Keep one fallback candidate until a preferred producer is found.
-                    best_producer = dep_id;
-                }
-            }
-
-            // if we found a producer and it got a register in Phase 1, use it
-            if (best_producer != -1 && new_dest_reg[best_producer] != -1) {
-                new_source_regs[id].push_back(new_dest_reg[best_producer]);
-            } else {
-                // mark as unresolved — Phase 4 will handle it
-                new_source_regs[id].push_back(-1);
-            }
-        }
-    }
+    b_phase2_resolve_sources(ordered_ids, instructions, analysis_table,
+                             analysis_index_by_id, scheduled_cycle,
+                             new_dest_reg, new_source_regs);
 
     // ========================================================================
     // PHASE 3: insert mov instructions for interloop dependencies
@@ -207,16 +692,15 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         // only BB1 instructions can have interloop dependencies
         if (instructions[id].basic_block != BasicBlock::BB1) continue;
 
-        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[id];
+        const int ai = analysis_index_by_id[id];
+        if (ai < 0) continue;
+        const DependencyAnalysisTableEntry& entry = analysis_table[ai];
 
         // for each source register this BB1 instruction reads...
         for (const int src_reg : instructions[id].source_registers) {
             int bb0_producer = -1;
             int bb1_producer = -1;
 
-            // We define the producer of this register as the instruction that writes to it and is closest to the consumer in the 
-            // schedule order (i.e. the latest scheduled producer in BB0, in BB1 it doesn't count).
             auto search_deps = [&](const std::vector<int>& deps) {
                 for (const int dep_id : deps) {
                     if (dep_id < 0 || dep_id >= instruction_count) continue;
@@ -233,23 +717,18 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
                 }
             };
 
-            // We update bb0_producer and bb1_producer by looking at all the dependencies of the consumer instruction (local, interloop, and loop invariant) 
-            // to find which instruction produces the value read by the consumer in BB0 and in BB1.
             search_deps(entry.local_dependencies);
             search_deps(entry.interloop_dependencies);
             search_deps(entry.loop_invariant_dependencies);
 
-            // we only need a mov when BOTH BB0 and BB1 producers produce the same register (we have a conflict!!)
+            // we only need a mov when BOTH BB0 and BB1 produce the same register
             // if only one produces it, there's no conflict to resolve
             if (bb0_producer != -1 && bb1_producer != -1 &&
                 new_dest_reg[bb0_producer] != -1 && new_dest_reg[bb1_producer] != -1) {
 
-                // don't add the same mov pair twice, so we check if it's already in the list before adding 
-                // (in case multiple instructions read the same register and have the same producers, we only need one mov)
+                // don't add the same mov pair twice
                 bool already_added = false;
                 for (const auto& mp : mov_pairs) {
-                    // These are the two regusters that are moved (we check if they are already in the list, 
-                    // otherwise we put them in the list to add the mov later)
                     if (mp.dest_reg == new_dest_reg[bb0_producer] && mp.src_reg == new_dest_reg[bb1_producer]) {
                         already_added = true;
                         break;
@@ -262,13 +741,12 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
         }
     }
 
-    // WE PLACE THE MOV IN THE SCHEDULE:
+    // now place each mov in the schedule
     // the mov reads from the BB1 producer, so it must respect the producer's latency
     // we try to place it as late as possible (near the loop instruction)
     // if there's no room, we push the loop instruction down
     for (const auto& mp : mov_pairs) {
         // the mov can't execute before the BB1 producer's result is ready
-        // it's this result that we have to mov later into the BB0 register, so we have to wait for it to be ready.
         int earliest_mov = scheduled_cycle[mp.bb1_prod_id] + instruction_latency(instructions[mp.bb1_prod_id].kind);
 
         while (true) {
@@ -322,77 +800,17 @@ AllocResult alloc_b(std::vector<Bundle>& schedule,
     }
 
     // ========================================================================
-    // PHASE 4: handle orphan operands (source registers with no known producer)
+    // PHASE 4: handle orphan operands (sources with no known producer)
     // ========================================================================
-    // some instructions read registers that no other instruction in the program writes to
-    // (e.g. function arguments, or base addresses assumed to already be in the register file)
-    // we assign them fresh registers, but if two instructions read the same orphan register
-    // they must get the same new register (they're reading the same pre-existing value)
-    std::map<int, int> orphan_reg_map; // maps original register number -> new register
-
-    for (const int id : ordered_ids) {
-        const Instruction& instr = instructions[id];
-        for (int s = 0; s < static_cast<int>(new_source_regs[id].size()); ++s) {
-            if (new_source_regs[id][s] == -1) { // this source register was unresolved in Phase 2, so it's an orphan that needs a new register
-                int orig_reg = instr.source_registers[s];
-                // check if we already assigned a register for this orphan
-                if (orphan_reg_map.find(orig_reg) != orphan_reg_map.end()) {
-                    new_source_regs[id][s] = orphan_reg_map[orig_reg];
-                } else {
-                    // first time seeing this orphan register — assign a fresh one
-                    orphan_reg_map[orig_reg] = next_reg;
-                    new_source_regs[id][s] = next_reg;
-                    next_reg++;
-                }
-            }
-        }
-    }
+    resolve_orphan_sources(ordered_ids, instructions, new_source_regs, next_reg);
 
     // ========================================================================
     // BUNDLE REWRITE: replace original instruction text with new register names
     // ========================================================================
-    // up to this point the bundles still contain the original text like "mulu x6, x5, x4"
-    // now we overwrite each slot with the rebuilt text using the new registers
-    // we skip BB2 instructions because they haven't been placed in the schedule yet
-    // (schedule_bb2 runs after alloc_b, and rewrite_bb2_bundles handles them)
-    for (const int id : ordered_ids) {
-        const Instruction& instr = instructions[id];
-
-        // BB2 isn't in the schedule yet — skip it
-        if (instr.basic_block == BasicBlock::BB2) continue;
-
-        // Extract the cycle at which this instruction is scheduled
-        // We'll need it to update the right bundle later 
-        int cycle = scheduled_cycle[id];
-        if (cycle < 0) continue;
-
-        // loop instruction: just update the branch target to point to loop_beginning
-        // (the original target was based on the input program's addresses, not the schedule's)
-        if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
-            schedule[cycle].BRANCH = instr.opcode + " " + std::to_string(loop_beginning);
-            continue;
-        }
-
-        // mov to LC/EC: the text is something like "mov LC, 100" — nothing to change
-        // These kinds of instructions have destination_register == -1.
-        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
-
-        // rebuild the instruction text with the new registers
-        std::string new_text = rebuild_instruction_text(instr, new_dest_reg[id], new_source_regs[id]);
-
-        // find which slot in the bundle this instruction occupies and overwrite it
-        // we match by raw_text because that's what was originally written into the slot
-        Bundle& b = schedule[cycle];
-        if (is_alu_kind(instr.kind)) {
-            // ALU instructions could be in either ALU0 or ALU1
-            if (b.ALU0 == instr.raw_text) b.ALU0 = new_text;
-            else if (b.ALU1 == instr.raw_text) b.ALU1 = new_text;
-        } else if (instr.kind == InstructionKind::Mulu) {
-            b.MUL = new_text;
-        } else if (instr.kind == InstructionKind::Ld || instr.kind == InstructionKind::St) {
-            b.MEM = new_text;
-        }
-    }
+    // BB2 instructions aren't in the schedule yet — rewrite_bb2_bundles handles them
+    // after schedule_bb2 places them.
+    apply_renaming_to_bundles(schedule, ordered_ids, instructions, scheduled_cycle,
+                              new_dest_reg, new_source_regs, loop_beginning, /*skip_bb2=*/true);
 
     // return the allocation results so that BB2 can be rewritten later
     // after schedule_bb2 places BB2 instructions into the schedule
@@ -409,31 +827,15 @@ void rewrite_bb2_bundles(std::vector<Bundle>& schedule,
                          const std::vector<Instruction>& instructions,
                          const std::vector<int>& scheduled_cycle,
                          const AllocResult& alloc) {
-
-    const int instruction_count = static_cast<int>(instructions.size());
-
-    for (int id = 0; id < instruction_count; ++id) {
+    for (int id = 0; id < static_cast<int>(instructions.size()); ++id) {
         const Instruction& instr = instructions[id];
-
-        // only interested in BB2 instructions
         if (instr.basic_block != BasicBlock::BB2) continue;
+        const int cycle = scheduled_cycle[id];
+        if (cycle < 0) continue;
 
-        int cycle = scheduled_cycle[id];
-        if (cycle < 0) continue; // shouldn't happen but just in case
-
-        // rebuild instruction text with the new registers from alloc_b
-        std::string new_text = rebuild_instruction_text(instr, alloc.new_dest_reg[id], alloc.new_source_regs[id]);
-
-        // find the slot and overwrite
-        Bundle& b = schedule[cycle];
-        if (is_alu_kind(instr.kind)) {
-            if (b.ALU0 == instr.raw_text) b.ALU0 = new_text;
-            else if (b.ALU1 == instr.raw_text) b.ALU1 = new_text;
-        } else if (instr.kind == InstructionKind::Mulu) {
-            b.MUL = new_text;
-        } else if (instr.kind == InstructionKind::Ld || instr.kind == InstructionKind::St) {
-            b.MEM = new_text;
-        }
+        const std::string new_text = rebuild_instruction_text(
+            instr, alloc.new_dest_reg[id], alloc.new_source_regs[id]);
+        rewrite_bundle_slot(schedule[cycle], instr, new_text);
     }
 }
 
@@ -446,393 +848,54 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
                     int num_stages,
                     const std::vector<int>& stage_by_id) {
 
+    // ------------------------------------------------------------------------
+    // Register allocation for loop.pip (allocr in PDF Section 3.3.2).
+    // The function is organized in four phases matching the PDF:
+    //   Phase 1: rotating registers for BB1 destinations
+    //   Phase 2: static registers for pure loop invariant BB0 producers
+    //   Phase 3: resolve BB1 source operands (equations 3 and 4)
+    //   Phase 4: allocate BB0/BB2 destinations and sources
+    // After the four phases we collapse the loop body into II bundles with
+    // predication and insert the mov EC / mov p32 setup (Section 3.4).
+    // ------------------------------------------------------------------------
+
     const int instruction_count = static_cast<int>(instructions.size());
-
-    // same slot priority and ordering as alloc_b
-    auto slot_priority = [](InstructionKind kind) -> int {
-        switch (kind) {
-            case InstructionKind::Add:
-            case InstructionKind::Addi:
-            case InstructionKind::Sub:
-            case InstructionKind::Mov:
-                return 0;
-            case InstructionKind::Mulu:
-                return 2;
-            case InstructionKind::Ld:
-            case InstructionKind::St:
-                return 3;
-            case InstructionKind::Loop:
-            case InstructionKind::LoopPip:
-                return 4;
-            default:
-                return 5;
-        }
-    };
-
-    std::vector<int> ordered_ids;
-    for (int i = 0; i < instruction_count; ++i) {
-        if (scheduled_cycle[i] >= 0) {
-            ordered_ids.push_back(i);
-        }
-    }
-    std::sort(ordered_ids.begin(), ordered_ids.end(), [&](int a, int b) {
-        if (scheduled_cycle[a] != scheduled_cycle[b])
-            return scheduled_cycle[a] < scheduled_cycle[b];
-        int pa = slot_priority(instructions[a].kind);
-        int pb = slot_priority(instructions[b].kind);
-        if (pa != pb) return pa < pb;
-        return a < b;
-    });
-
-    // append BB2 instructions at the end (not scheduled yet)
-    for (int i = 0; i < instruction_count; ++i) {
-        if (instructions[i].basic_block == BasicBlock::BB2 && scheduled_cycle[i] < 0) {
-            ordered_ids.push_back(i);
-        }
-    }
+    const std::vector<int> analysis_index_by_id =
+        build_analysis_index_by_id(analysis_table, instruction_count);
+    const std::vector<int> ordered_ids = build_ordered_ids(instructions, scheduled_cycle);
 
     std::vector<int> new_dest_reg(instruction_count, -1);
     std::vector<std::vector<int>> new_source_regs(instruction_count);
-
-    // ========================================================================
-    // PHASE 1: assign rotating registers to BB1 destinations
-    // ========================================================================
-    // BB1 destinations get rotating registers starting from x32
-    // spaced by (num_stages + 1) to avoid conflicts across iterations
-    int rotating_stride = num_stages + 1;
-    int next_rotating_reg = 32;
-
-    for (const int id : ordered_ids) {
-        if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        const Instruction& instr = instructions[id];
-
-        // same skips as alloc_b
-        if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) continue;
-        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
-        if (instr.kind == InstructionKind::St) continue;
-
-        if (instr.destination_register != -1) {
-            new_dest_reg[id] = next_rotating_reg;
-            next_rotating_reg += rotating_stride;
-        }
-    }
-
-    // ========================================================================
-    // PHASE 2: assign static registers to loop invariants
-    // ========================================================================
-    // loop invariant producers are BB0 instructions that feed BB1 but whose
-    // value never changes during the loop. they get simple static registers.
-    // however if a BB0 instruction is also an interloop initializer (it appears
-    // in some BB1 instruction's interloop_dependencies), we skip it here —
-    // it gets handled in Phase 4 with rotation offsets.
     int next_static_reg = 1;
 
-    // first build a set of BB0 instruction ids that appear in interloop deps
-    // these are interloop initializers, not pure loop invariants.
-    // IMPORTANT: when multiple BB0 instructions write the same register and all
-    // appear in interloop_dependencies, only the LAST one (latest in program order)
-    // is the actual initializer. Earlier ones just feed later BB0 instructions.
-    std::vector<bool> is_interloop_initializer(instruction_count, false);
-    for (const int id : ordered_ids) {
-        if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[id];
+    // Phase 1: rotating registers for BB1 destinations.
+    r_phase1_rotating_dests(ordered_ids, instructions, num_stages, new_dest_reg);
 
-        // group BB0 interloop deps by the register they write
-        // only the latest one per register is the true initializer
-        std::map<int, int> latest_bb0_per_reg; // dest_register -> latest BB0 instruction id
-        for (const int dep_id : entry.interloop_dependencies) {
-            if (dep_id < 0 || dep_id >= instruction_count) continue;
-            if (instructions[dep_id].basic_block != BasicBlock::BB0) continue;
-            int dreg = instructions[dep_id].destination_register;
-            if (dreg < 0) continue;
-            if (latest_bb0_per_reg.find(dreg) == latest_bb0_per_reg.end() || dep_id > latest_bb0_per_reg[dreg]) {
-                latest_bb0_per_reg[dreg] = dep_id;
-            }
-        }
-        for (const auto& kv : latest_bb0_per_reg) {
-            is_interloop_initializer[kv.second] = true;
-        }
-    }
+    // Identify BB0 interloop initializers — needed by phase 2 (to skip them) and phase 4.
+    const std::vector<bool> is_interloop_initializer =
+        r_find_interloop_initializers(ordered_ids, instructions, analysis_table, analysis_index_by_id);
 
-    // now assign static regs to pure loop invariant producers
-    // track which BB0 ids we've already assigned to avoid duplicates
-    std::vector<bool> invariant_assigned(instruction_count, false);
-    for (const int id : ordered_ids) {
-        if (instructions[id].basic_block != BasicBlock::BB1) continue;
-        if (id < 0 || id >= static_cast<int>(analysis_table.size())) continue;
-        const DependencyAnalysisTableEntry& entry = analysis_table[id];
+    // Phase 2: static registers for pure loop invariant BB0 producers.
+    r_phase2_invariant_dests(ordered_ids, instructions, analysis_table, analysis_index_by_id,
+                             is_interloop_initializer, new_dest_reg, next_static_reg);
 
-        for (const int dep_id : entry.loop_invariant_dependencies) {
-            if (dep_id < 0 || dep_id >= instruction_count) continue;
-            if (instructions[dep_id].basic_block != BasicBlock::BB0) continue;
-            // skip if this BB0 instruction is also an interloop initializer
-            if (is_interloop_initializer[dep_id]) continue;
-            // skip if already assigned
-            if (invariant_assigned[dep_id]) continue;
+    // Phase 3: resolve source operands of BB1 instructions.
+    r_phase3_bb1_sources(ordered_ids, instructions, analysis_table, analysis_index_by_id,
+                         new_dest_reg, stage_by_id, new_source_regs);
 
-            new_dest_reg[dep_id] = next_static_reg;
-            next_static_reg++;
-            invariant_assigned[dep_id] = true;
-        }
-    }
+    // Phase 4a: BB0 interloop initializer destinations must match their BB1 producer.
+    r_phase4_bb0_initializer_dests(ordered_ids, instructions, analysis_table, analysis_index_by_id,
+                                   is_interloop_initializer, stage_by_id, new_dest_reg);
 
-    // ========================================================================
-    // PHASE 3: link BB1 source operands using stage/iteration offsets
-    // ========================================================================
-    // for each BB1 instruction's source, find the producer and apply:
-    //   loop invariant -> just use the static register from Phase 2
-    //   local dep (same iteration) -> equation 3: reg + (St(consumer) - St(producer))
-    //   interloop dep (prev iteration, BB1 producer) -> equation 4: reg + (St(consumer) - St(producer)) + 1
-    //   interloop dep pointing to BB0 initializer -> skip here, resolved via the BB0 dest in Phase 4
+    // Phase 4b: assign static regs to any remaining BB0 and BB2 destinations.
+    r_phase4_static_dests(ordered_ids, instructions, new_dest_reg, next_static_reg);
 
-    for (const int id : ordered_ids) {
-        const Instruction& instr = instructions[id];
+    // Phase 4c: resolve source operands of BB0 and BB2 instructions.
+    r_phase4_bb0_bb2_sources(ordered_ids, instructions, analysis_table, analysis_index_by_id,
+                             new_dest_reg, stage_by_id, num_stages, new_source_regs);
 
-        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
-            new_source_regs[id] = {};
-            continue;
-        }
-
-        // BB0 and BB2 operands are handled in Phase 4
-        if (instr.basic_block != BasicBlock::BB1) {
-            // placeholder — Phase 4 will fill these
-            for (int s = 0; s < static_cast<int>(instr.source_registers.size()); ++s) {
-                new_source_regs[id].push_back(-1);
-            }
-            continue;
-        }
-
-        const DependencyAnalysisTableEntry& entry = analysis_table[id];
-        int consumer_stage = stage_by_id[id];
-
-        for (const int src_reg : instr.source_registers) {
-            int resolved_reg = -1;
-
-            // check loop invariant dependencies first
-            for (const int dep_id : entry.loop_invariant_dependencies) {
-                if (dep_id < 0 || dep_id >= instruction_count) continue;
-                if (instructions[dep_id].destination_register != src_reg) continue;
-                // pure loop invariant — use static register directly
-                if (new_dest_reg[dep_id] != -1) {
-                    resolved_reg = new_dest_reg[dep_id];
-                }
-                break;
-            }
-
-            // check local dependencies (same iteration, same BB1)
-            if (resolved_reg == -1) {
-                for (const int dep_id : entry.local_dependencies) {
-                    if (dep_id < 0 || dep_id >= instruction_count) continue;
-                    if (instructions[dep_id].destination_register != src_reg) continue;
-                    if (new_dest_reg[dep_id] == -1) continue;
-
-                    int producer_stage = stage_by_id[dep_id];
-                    // equation 3: produced_reg + (St(consumer) - St(producer))
-                    resolved_reg = new_dest_reg[dep_id] + (consumer_stage - producer_stage);
-                    break;
-                }
-            }
-
-            // check interloop dependencies (previous iteration)
-            if (resolved_reg == -1) {
-                for (const int dep_id : entry.interloop_dependencies) {
-                    if (dep_id < 0 || dep_id >= instruction_count) continue;
-                    if (instructions[dep_id].destination_register != src_reg) continue;
-
-                    if (instructions[dep_id].basic_block == BasicBlock::BB1) {
-                        if (new_dest_reg[dep_id] == -1) continue;
-                        int producer_stage = stage_by_id[dep_id];
-                        // equation 4: produced_reg + (St(consumer) - St(producer)) + 1
-                        resolved_reg = new_dest_reg[dep_id] + (consumer_stage - producer_stage) + 1;
-                        break;
-                    }
-                    // BB0 interloop initializer — the consumer reads the same register
-                    // as the BB1 interloop producer but with the +1 offset.
-                    // we need to find the corresponding BB1 producer for this register.
-                    if (instructions[dep_id].basic_block == BasicBlock::BB0) {
-                        // find the BB1 instruction that also produces this register
-                        // (it's in the interloop deps too)
-                        for (const int other_dep : entry.interloop_dependencies) {
-                            if (other_dep < 0 || other_dep >= instruction_count) continue;
-                            if (instructions[other_dep].destination_register != src_reg) continue;
-                            if (instructions[other_dep].basic_block == BasicBlock::BB1) {
-                                if (new_dest_reg[other_dep] == -1) continue;
-                                int producer_stage = stage_by_id[other_dep];
-                                // same as equation 4
-                                resolved_reg = new_dest_reg[other_dep] + (consumer_stage - producer_stage) + 1;
-                                break;
-                            }
-                        }
-                        if (resolved_reg != -1) break;
-                    }
-                }
-            }
-
-            new_source_regs[id].push_back(resolved_reg);
-        }
-    }
-
-    // ========================================================================
-    // PHASE 4: allocate BB0 and BB2 registers
-    // ========================================================================
-
-    // CASE A: BB0 interloop initializers
-    // if a BB0 instruction is an interloop initializer, its dest register
-    // must match the BB1 producer's register with offsets so that the first
-    // iteration reads the correct value
-    for (int id = 0; id < instruction_count; ++id) {
-        if (instructions[id].basic_block != BasicBlock::BB0) continue;
-        if (!is_interloop_initializer[id]) continue;
-        if (new_dest_reg[id] != -1) continue; // already assigned
-
-        int orig_dest = instructions[id].destination_register;
-        if (orig_dest == -1) continue;
-
-        // find the BB1 instruction that produces the same register and is
-        // listed as an interloop dependency consumer of this BB0 instruction
-        for (const int consumer_id : ordered_ids) {
-            if (instructions[consumer_id].basic_block != BasicBlock::BB1) continue;
-            if (consumer_id < 0 || consumer_id >= static_cast<int>(analysis_table.size())) continue;
-            const DependencyAnalysisTableEntry& entry = analysis_table[consumer_id];
-
-            for (const int dep_id : entry.interloop_dependencies) {
-                if (dep_id != id) continue; // we want the entry that lists THIS bb0 instruction
-
-                // now find the BB1 producer of the same register in the interloop deps
-                for (const int other_dep : entry.interloop_dependencies) {
-                    if (other_dep < 0 || other_dep >= instruction_count) continue;
-                    if (instructions[other_dep].basic_block != BasicBlock::BB1) continue;
-                    if (instructions[other_dep].destination_register != orig_dest) continue;
-                    if (new_dest_reg[other_dep] == -1) continue;
-
-                    int producer_stage = stage_by_id[other_dep];
-                    // dest = produced_reg + 1 - St(producer)
-                    new_dest_reg[id] = new_dest_reg[other_dep] + 1 - producer_stage;
-                    goto done_bb0_initializer;
-                }
-            }
-        }
-        done_bb0_initializer:;
-    }
-
-    // CASE B: BB0 instructions with local dependencies that haven't been assigned yet
-    // (non-interloop, non-invariant BB0 instructions like "mov LC, 100")
-    // assign them static registers if they have a dest
-    for (const int id : ordered_ids) {
-        if (instructions[id].basic_block != BasicBlock::BB0) continue;
-        if (new_dest_reg[id] != -1) continue; // already assigned
-        const Instruction& instr = instructions[id];
-        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
-        if (instr.kind == InstructionKind::St) continue;
-        if (instr.destination_register != -1) {
-            new_dest_reg[id] = next_static_reg;
-            next_static_reg++;
-        }
-    }
-
-    // BB2 destinations — assign static regs
-    for (const int id : ordered_ids) {
-        if (instructions[id].basic_block != BasicBlock::BB2) continue;
-        if (new_dest_reg[id] != -1) continue;
-        const Instruction& instr = instructions[id];
-        if (instr.kind == InstructionKind::St) continue;
-        if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
-        if (instr.destination_register != -1) {
-            new_dest_reg[id] = next_static_reg;
-            next_static_reg++;
-        }
-    }
-
-    // now resolve BB0 and BB2 source operands
-    for (const int id : ordered_ids) {
-        const Instruction& instr = instructions[id];
-        if (instr.basic_block == BasicBlock::BB1) continue; // already done in Phase 3
-
-        if (id < 0 || id >= static_cast<int>(analysis_table.size()) || instr.source_registers.empty()) {
-            if (new_source_regs[id].empty()) new_source_regs[id] = {};
-            continue;
-        }
-
-        const DependencyAnalysisTableEntry& entry = analysis_table[id];
-
-        // rebuild source regs for this instruction
-        new_source_regs[id].clear();
-
-        for (const int src_reg : instr.source_registers) {
-            int resolved_reg = -1;
-
-            if (instr.basic_block == BasicBlock::BB0) {
-                // BB0 sources: check local deps within BB0
-                for (const int dep_id : entry.local_dependencies) {
-                    if (dep_id < 0 || dep_id >= instruction_count) continue;
-                    if (instructions[dep_id].destination_register != src_reg) continue;
-                    if (new_dest_reg[dep_id] != -1) {
-                        resolved_reg = new_dest_reg[dep_id];
-                        break;
-                    }
-                }
-            }
-
-            if (instr.basic_block == BasicBlock::BB2) {
-                // CASE C: post-loop dependency — value from last iteration of BB1
-                for (const int dep_id : entry.post_loop_dependencies) {
-                    if (dep_id < 0 || dep_id >= instruction_count) continue;
-                    if (instructions[dep_id].destination_register != src_reg) continue;
-                    if (instructions[dep_id].basic_block == BasicBlock::BB1 && new_dest_reg[dep_id] != -1) {
-                        int producer_stage = stage_by_id[dep_id];
-                        // iteration_offset = 0, stage_offset = (num_stages - 1) - St(producer)
-                        resolved_reg = new_dest_reg[dep_id] + (num_stages - 1) - producer_stage;
-                        break;
-                    }
-                }
-
-                // CASE D: loop invariant read from BB2
-                if (resolved_reg == -1) {
-                    for (const int dep_id : entry.loop_invariant_dependencies) {
-                        if (dep_id < 0 || dep_id >= instruction_count) continue;
-                        if (instructions[dep_id].destination_register != src_reg) continue;
-                        if (new_dest_reg[dep_id] != -1) {
-                            resolved_reg = new_dest_reg[dep_id];
-                            break;
-                        }
-                    }
-                }
-
-                // local dep within BB2
-                if (resolved_reg == -1) {
-                    for (const int dep_id : entry.local_dependencies) {
-                        if (dep_id < 0 || dep_id >= instruction_count) continue;
-                        if (instructions[dep_id].destination_register != src_reg) continue;
-                        if (new_dest_reg[dep_id] != -1) {
-                            resolved_reg = new_dest_reg[dep_id];
-                            break;
-                        }
-                    }
-                }
-            }
-
-            new_source_regs[id].push_back(resolved_reg);
-        }
-    }
-
-    // CASE E: orphan operands — same as alloc_b Phase 4
-    std::map<int, int> orphan_reg_map;
-    for (const int id : ordered_ids) {
-        const Instruction& instr = instructions[id];
-        for (int s = 0; s < static_cast<int>(new_source_regs[id].size()); ++s) {
-            if (new_source_regs[id][s] == -1) {
-                int orig_reg = instr.source_registers[s];
-                if (orphan_reg_map.find(orig_reg) != orphan_reg_map.end()) {
-                    new_source_regs[id][s] = orphan_reg_map[orig_reg];
-                } else {
-                    orphan_reg_map[orig_reg] = next_static_reg;
-                    new_source_regs[id][s] = next_static_reg;
-                    next_static_reg++;
-                }
-            }
-        }
-    }
+    // Orphan sources: registers not written by any instruction get fresh static regs.
+    resolve_orphan_sources(ordered_ids, instructions, new_source_regs, next_static_reg);
 
     // ========================================================================
     // LOOP PREPARATION (Section 3.4)
@@ -980,26 +1043,17 @@ AllocResult alloc_r(std::vector<Bundle>& schedule,
         scheduled_cycle[li.id] = target_cycle;
     }
 
-    // rewrite BB0 instruction texts with new registers
+    // Rewrite BB0 instruction texts with the new registers.
     for (const int id : ordered_ids) {
         const Instruction& instr = instructions[id];
         if (instr.basic_block != BasicBlock::BB0) continue;
-        int cycle = scheduled_cycle[id];
+        const int cycle = scheduled_cycle[id];
         if (cycle < 0) continue;
-
         if (instr.kind == InstructionKind::Mov && instr.destination_register == -1) continue;
 
-        std::string new_text = rebuild_instruction_text(instr, new_dest_reg[id], new_source_regs[id]);
-
-        Bundle& b = schedule[cycle];
-        if (is_alu_kind(instr.kind)) {
-            if (b.ALU0 == instr.raw_text) b.ALU0 = new_text;
-            else if (b.ALU1 == instr.raw_text) b.ALU1 = new_text;
-        } else if (instr.kind == InstructionKind::Mulu) {
-            b.MUL = new_text;
-        } else if (instr.kind == InstructionKind::Ld || instr.kind == InstructionKind::St) {
-            b.MEM = new_text;
-        }
+        const std::string new_text = rebuild_instruction_text(
+            instr, new_dest_reg[id], new_source_regs[id]);
+        rewrite_bundle_slot(schedule[cycle], instr, new_text);
     }
 
     // trim schedule to BB0 + ec/p32 bundle + II loop bundles
