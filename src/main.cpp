@@ -6,10 +6,8 @@
 #include <exception>
 #include <iostream>
 
-// it is a function that converts our Bundle structs into the 5-slot string arrays that write_packets expects
-// it takes schedule as input, which is a vector of Bundles, and for each bundle it creates a vector of strings with the instructions in the order ALU0, ALU1, MUL, MEM, BRANCH
-// it gives as output a vector of vector of strings, where each inner vector is a packet (so the instructions scheduled in the same cycle) and the outer vector is the whole schedule
-// is used to convert the schedule into the right format for output and testing
+// convert bundles into the 5-slot packet format expected by write_packets
+// slot order is fixed: ALU0, ALU1, MUL, MEM, BRANCH
 std::vector<std::vector<std::string>> bundles_to_packets(const std::vector<Bundle>& schedule) {
     std::vector<std::vector<std::string>> packets;
     for (const auto& b : schedule) {
@@ -24,18 +22,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const std::string input_path = argv[1]; // input JSON file with instruction strings
-    const std::string loop_output = argv[2]; // output JSON file for the basic schedule
-    const std::string looppip_output = argv[3]; // output JSON file for the loop.pip schedule 
+    const std::string input_path = argv[1];      // input json
+    const std::string loop_output = argv[2];     // output for normal loop schedule
+    const std::string looppip_output = argv[3];  // output for loop.pip schedule
 
     try {
-        // This loads JSON instruction strings and parses them into typed records.
+        // read and parse instructions
         std::vector<Instruction> instructions = IOHandler::read_and_parse_instructions(input_path);
 
-        // This assigns the basic block information for each instruction based on loop boundaries.
+        // tag each instruction as BB0 / BB1 / BB2
         update_instructions_bb(instructions);
 
-        // This performs dependency analysis and fills the analysis table with dependency information.
+        // build dependency table used by both schedulers
         std::vector<DependencyAnalysisTableEntry> analysis_table;
         dependency_analysis(instructions, analysis_table);
 
@@ -44,11 +42,12 @@ int main(int argc, char* argv[]) {
         std::vector<int> sched_cycle_basic(instructions.size(), -1);
         schedule_ASAP_basic(analysis_table, schedule_basic, instructions, sched_cycle_basic);
         AllocResult alloc_result = alloc_b(schedule_basic, analysis_table, instructions, sched_cycle_basic);
+        // BB2 is scheduled after allocation, then rewritten with the allocated regs
         schedule_bb2(analysis_table, schedule_basic, instructions, sched_cycle_basic);
         rewrite_bb2_bundles(schedule_basic, instructions, sched_cycle_basic, alloc_result);
-        IOHandler::write_packets(loop_output, bundles_to_packets(schedule_basic)); // here we output the basic schedule 
+        IOHandler::write_packets(loop_output, bundles_to_packets(schedule_basic)); // write normal schedule
 
-        // check if the program has a loop instruction
+        // if there is no loop/loop.pip instruction, advanced scheduling is skipped
         bool has_loop = false;
         for (const auto& instr : instructions) {
             if (instr.kind == InstructionKind::Loop || instr.kind == InstructionKind::LoopPip) {
@@ -57,7 +56,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // loop.pip schedule
+        // build loop.pip output
         if (has_loop) {
             std::vector<Bundle> schedule_adv;
             std::vector<int> sched_cycle_adv(instructions.size(), -1);
