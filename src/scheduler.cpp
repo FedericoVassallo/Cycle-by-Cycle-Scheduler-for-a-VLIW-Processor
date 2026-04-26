@@ -27,7 +27,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
     // this is a vector of boolean of lenght = instr count and that initially is set to false
     std::vector<bool> is_bb1(instruction_count, false); // To quickly check if an instruction belongs to BB1
 
-    // in this block we chaterize and orginize the instructions based on the basic block they belong to and we fill the kind_by_id vector
+    // in this block we characterize and organize the instructions based on the basic block they belong to and we fill the kind_by_id vector
     for (int analysis_index = 0; analysis_index < static_cast<int>(analysis_table.size()); ++analysis_index) {
 
         // loop through all dependency analysis entries
@@ -124,7 +124,7 @@ void schedule_ASAP_basic(const std::vector<DependencyAnalysisTableEntry>& analys
         scheduled_cycle[id] = cycle;
     }
 
-    // here it search for the last cycle where we scheduled a BB1 instruction
+    // here it searches for the last cycle where we scheduled a BB1 instruction
     int last_bb1_cycle = loop_beginning; // We start from here 
     for (const int id : bb1_non_loop_ids) {
         last_bb1_cycle = std::max(last_bb1_cycle, scheduled_cycle[id]);
@@ -264,7 +264,7 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
 
     // the for iterates over the lenght of the analysis table
     for (int analysis_index = 0; analysis_index < static_cast<int>(analysis_table.size()); ++analysis_index) {
-        // just a shortcut to write entry instead of analysis_table[analysis_index] every time
+        
         const DependencyAnalysisTableEntry& entry = analysis_table[analysis_index];
         if (entry.id < 0 || entry.id >= instruction_count) continue; // Sanity check
 
@@ -424,11 +424,8 @@ void schedule_ASAP_advanced(const std::vector<DependencyAnalysisTableEntry>& ana
     // record its position 
     scheduled_cycle[loop_id] = loop_cycle;
 
-    // We need to know how many stages each instruction "slips" forward.
-    // This is essential for:
-    // - Predication: To know which stage predicate (P0, P1, ...) controls the instruction.
-    // - Register Allocation: To handle rotating registers correctly.
-
+    // We need to know how many stages each instruction goes forward.
+    // This is essential for predication and register allocation
     std::vector<int> stage_by_id(instruction_count, -1);
     int max_stage = 0;
 
